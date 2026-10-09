@@ -1,3 +1,6 @@
+#ifndef _WIN32
+#include <sched.h>
+#endif
 #include "prx/libkernel/Time/include/TimedWait.hpp"
 #include "prx/libkernel/Pthread/include/WindowsThreadLocal.hpp"
 
@@ -519,6 +522,14 @@ void WakeChangeSleepers() {
 }
 
 void SleepNanos(std::uint64_t nanos) {
+#ifndef _WIN32
+    // Local: a zero sleep yields on the console; returning at once turned title job-thread polling
+    // (Demon's Souls) into a pure spin that starved the GPU queue workers.
+    if (nanos == 0) {
+        sched_yield();
+        return;
+    }
+#endif
     if (nanos == 0) return;
 #ifdef _WIN32
     if (Coarse()) {
