@@ -384,6 +384,17 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
 
             std::string reason = error.what();
             if (const auto newline = reason.find('\n'); newline != std::string::npos) reason.resize(newline);
+            // PROBE (2026-10-12, Demon's Souls): compute shader 0x8489fbb00 intermittently finds garbage in its
+            // descriptor tables (runs OBS-0838 at minute 4 and 1146 at frame 543, two different decode errors, about
+            // 2 runs in 9) and the uncaught error ended the title. The dispatch is dropped; the title issues it again
+            // next frame. APS5_STRICT_DISPATCH=1 restores the fatal error.
+            static const bool strictDispatch = std::getenv("APS5_STRICT_DISPATCH") != nullptr;
+            if (!strictDispatch && (reason.find("runtime image descriptor is invalid") != std::string::npos || reason.find("buffer descriptor uses an unsupported type") != std::string::npos)) {
+                static std::atomic<unsigned> dropped{0};
+                const auto count = ++dropped;
+                if (count <= 8 || (count & (count - 1)) == 0) std::fprintf(stderr, "[dispatch] compute shader 0x%llx dropped (#%u): %s%s%s\n", static_cast<unsigned long long>(address), count, reason.c_str(), dump.empty() ? "" : " - request ", dump.c_str());
+                return;
+            }
             char where[96];
             if (dump.empty()) std::snprintf(where, sizeof(where), "compute shader 0x%llx: ", static_cast<unsigned long long>(address));
             else std::snprintf(where, sizeof(where), "compute shader 0x%llx (%s): ", static_cast<unsigned long long>(address), dump.c_str());
