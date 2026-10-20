@@ -122,10 +122,7 @@ extern "C" void AgcDriverSuspendPoint_nid_postfix() try {
 
 extern "C" std::uint32_t AgcDriverReserveEopFlip_nid_postfix(const AgcDriver::FlipInfo& info) {
     const auto token = AgcDriver::DriverDetail::Driver::Get().ReserveEopFlip(info);
-    if (auto* const recorder = AgcDriver::FrameRecorder::Active(); recorder != nullptr && token != 0) {
-        recorder->ReserveEopFlip(info, token);
-        recorder->FrameBoundary();
-    }
+    if (auto* const recorder = AgcDriver::FrameRecorder::Active(); recorder != nullptr && token != 0) recorder->ReserveEopFlip(info, token);
     return token;
 }
 
