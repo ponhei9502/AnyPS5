@@ -210,6 +210,7 @@ Skipped restoreMemory(const FrameCaptureReader& reader) {
             const bool gpu = (chunk.access & FrameRangeAccess::Gpu) != 0;
             if (committedWritable(chunk.address, chunk.bytes)) {
                 if (!gpu) skipped.Add(chunk);
+                else std::memset(reinterpret_cast<void*>(static_cast<std::uintptr_t>(chunk.address)), 0, static_cast<std::size_t>(chunk.bytes));
                 continue;
             }
             auto* const pointer = reinterpret_cast<void*>(static_cast<std::uintptr_t>(chunk.address));
@@ -255,8 +256,8 @@ struct Replay {
     const Options& options;
     const FrameCaptureReader& reader;
     Frames frames;
-    std::mutex outputsMutex;
-    std::vector<std::shared_ptr<ReplayOutput>> outputs;
+    std::map<std::uint32_t, std::shared_ptr<ReplayOutput>> outputs;
+    std::mutex memoryMutex;
     std::map<std::uint64_t, std::vector<const FrameMemoryChunk*>> groups;
     Skipped skipped;
     std::atomic<std::uint64_t> paceTimeouts{0};
@@ -340,12 +341,16 @@ struct Replay {
             return;
         }
         case FrameCallKind::RegisterVideoOutput: {
+            const auto handle = static_cast<std::uint32_t>(call.values.at(0));
             auto output = std::make_shared<ReplayOutput>(frames);
-            {
-                std::lock_guard lock(outputsMutex);
-                outputs.push_back(output);
-            }
-            AgcDriverRegisterVideoOutput_nid_postfix(static_cast<std::uint32_t>(call.values.at(0)), output);
+            AgcDriverRegisterVideoOutput_nid_postfix(handle, output);
+            outputs.emplace(handle, std::move(output));
+            return;
+        }
+        case FrameCallKind::UnregisterVideoOutput: {
+            const auto handle = static_cast<std::uint32_t>(call.values.at(0));
+            AgcDriverUnregisterVideoOutput_nid_postfix(handle, outputs.at(handle));
+            outputs.erase(handle);
             return;
         }
         case FrameCallKind::SetTessellationFactorRing:
@@ -370,6 +375,7 @@ struct Replay {
             AgcDriverSuspendPoint_nid_postfix();
             return;
         case FrameCallKind::Memory: {
+            std::lock_guard lock(memoryMutex);
             const auto found = groups.find(call.values.at(0));
             if (found == groups.end()) return;
             for (const auto* chunk : found->second) {
@@ -443,6 +449,7 @@ struct Replay {
     }
 
     void releaseAwaited(std::span<const FrameCall> calls, std::size_t from) {
+        std::lock_guard lock(memoryMutex);
         std::array<AgcDriver::AwaitedWait, 64> awaited{};
         const auto count = AgcDriverAwaitedWaits_nid_postfix(awaited.data(), awaited.size());
         for (std::size_t slot = 0; slot < count; ++slot) {
@@ -497,18 +504,23 @@ struct Replay {
         for (const auto& entry : byThread) {
             workers.emplace_back([&, &indices = entry.second] {
                 for (const auto index : indices) {
-                    {
-                        std::unique_lock lock(mutex);
-                        turn.wait(lock, [&] { return started == index || failure != nullptr; });
-                        if (failure != nullptr) return;
+                    std::unique_lock lock(mutex);
+                    turn.wait(lock, [&] { return started == index || failure != nullptr; });
+                    if (failure != nullptr) return;
+                    const auto advance = [&] {
                         ++started;
                         sequenced.store(started);
-                    }
-                    turn.notify_all();
+                        lock.unlock();
+                        turn.notify_all();
+                    };
+                    const auto kind = calls[index].kind;
+                    const bool ordered = kind == FrameCallKind::Memory || kind == FrameCallKind::RegisterVideoOutput || kind == FrameCallKind::UnregisterVideoOutput;
+                    if (!ordered) advance();
                     try {
                         execute(calls[index]);
+                        if (ordered) advance();
                     } catch (...) {
-                        std::lock_guard lock(mutex);
+                        if (!lock.owns_lock()) lock.lock();
                         if (failure == nullptr) failure = std::current_exception();
                         turn.notify_all();
                         return;

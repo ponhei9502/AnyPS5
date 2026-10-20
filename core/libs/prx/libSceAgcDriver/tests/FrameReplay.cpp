@@ -142,11 +142,18 @@ void testCaptureAndReplay(const std::filesystem::path& tool) {
     const auto second = pattern(101);
     auto output = std::make_shared<Output>();
     AgcDriverRegisterVideoOutput_nid_postfix(Handle, output);
+    AgcDriverUnregisterVideoOutput_nid_postfix(Handle, output);
+    output = std::make_shared<Output>();
+    AgcDriverRegisterVideoOutput_nid_postfix(Handle, output);
 
     flip();
     std::memcpy(layout.source, first.data(), first.size());
     copyFrame(layout.firstCommands, layout, layout.firstTarget);
     flip();
+    AgcDriverWaitIdle_nid_postfix();
+    AgcDriverUnregisterVideoOutput_nid_postfix(Handle, output);
+    output = std::make_shared<Output>();
+    AgcDriverRegisterVideoOutput_nid_postfix(Handle, output);
     std::memcpy(layout.source, second.data(), second.size());
     copyFrame(layout.secondCommands, layout, layout.secondTarget);
     flip();
@@ -156,15 +163,18 @@ void testCaptureAndReplay(const std::filesystem::path& tool) {
     const FrameCaptureReader reader(capture);
     check(!reader.Truncated(), "the capture is truncated");
     check(reader.Header().find("\"frames\":2") != std::string::npos, "the capture header does not record two frames: " + reader.Header());
-    std::size_t submits = 0, flips = 0, memory = 0, starts = 0;
+    std::size_t submits = 0, flips = 0, memory = 0, starts = 0, registrations = 0, unregistrations = 0;
     for (const auto& call : reader.Calls()) {
         submits += call.kind == FrameCallKind::Submit;
         flips += call.kind == FrameCallKind::Flip;
         memory += call.kind == FrameCallKind::Memory;
         starts += call.kind == FrameCallKind::FrameStart;
+        registrations += call.kind == FrameCallKind::RegisterVideoOutput;
+        unregistrations += call.kind == FrameCallKind::UnregisterVideoOutput;
     }
     check(starts == 1 && submits == 2 && flips == 2, "the capture holds " + std::to_string(submits) + " submits and " + std::to_string(flips) + " flips after " + std::to_string(starts) + " frame starts");
     check(memory >= 2, "the CPU writes before each copy were not recorded as memory deltas");
+    check(registrations == 3 && unregistrations == 2, "video output close and reopen was not recorded before and during capture");
     const auto snapshot = std::any_of(reader.Chunks().begin(), reader.Chunks().end(), [&](const auto& chunk) {
         return chunk.kind == FrameMemoryKind::Range && chunk.address <= at(layout.base) && at(layout.base) + BlockBytes <= chunk.address + chunk.bytes;
     });

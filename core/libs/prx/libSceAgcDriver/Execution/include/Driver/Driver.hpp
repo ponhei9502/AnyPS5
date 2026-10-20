@@ -117,6 +117,7 @@ private:
     Driver();
     void rethrowFailure() const;
     void checkStopping() const;
+    std::uint32_t reserveEopFlip(const FlipInfo& info, std::uint32_t token);
     static bool& onWorkerThread();
     static void copyCommands(Submission& submission, const std::uint32_t* guest, std::size_t words);
     static bool copySegment(Submission& submission, const std::uint32_t* guest, std::size_t words, std::size_t& budget);

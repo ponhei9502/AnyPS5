@@ -87,9 +87,14 @@ std::vector<FrameCall> sampleCalls() {
     flip.cpuFlip = true;
     flip.values = {1, 2, 0, static_cast<std::uint64_t>(-5)};
     calls.push_back(flip);
+    FrameCall unregister;
+    unregister.kind = FrameCallKind::UnregisterVideoOutput;
+    unregister.ordinal = 5;
+    unregister.values = {1};
+    calls.push_back(unregister);
     FrameCall end;
     end.kind = FrameCallKind::End;
-    end.ordinal = 5;
+    end.ordinal = 6;
     calls.push_back(end);
     return calls;
 }

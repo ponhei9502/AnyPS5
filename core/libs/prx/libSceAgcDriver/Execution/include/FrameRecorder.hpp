@@ -34,6 +34,7 @@ public:
     void ResolveGraphicsStagesAbi(std::span<const Shader* const> stages, std::span<const ShaderRegister> context, std::span<const ShaderRegister> primitive);
     void ResolveGraphicsAbi(const Shader* vertex, const Shader* pixel, std::uint32_t primitiveType);
     void RegisterVideoOutput(std::uint32_t handle);
+    void UnregisterVideoOutput(std::uint32_t handle);
     void Submit(const Packet& packet, std::uint32_t queue);
     void Flip(const FlipInfo& info);
     void ReserveEopFlip(const FlipInfo& info, std::uint32_t token);

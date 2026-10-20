@@ -158,6 +158,12 @@ void FrameRecorder::RegisterVideoOutput(std::uint32_t handle) {
     record(std::move(call), true);
 }
 
+void FrameRecorder::UnregisterVideoOutput(std::uint32_t handle) {
+    auto call = make(FrameCallKind::UnregisterVideoOutput);
+    call.values = {handle};
+    record(std::move(call), true);
+}
+
 void FrameRecorder::Submit(const Packet& packet, std::uint32_t queue) {
     auto call = make(FrameCallKind::Submit);
     call.queue = queue;
@@ -288,20 +294,20 @@ void FrameRecorder::emitShaderDelta(std::span<const Shader* const> shaders) {
     std::uintptr_t arenaBase = 0;
     std::size_t arenaBytes = 0;
     GuestArena::GuestArenaRange_nid_postfix(&arenaBase, &arenaBytes);
-    const auto note = [&](const void* address) {
+    const auto note = [&](const void* address, std::uint64_t bytes = 0) {
         if (address == nullptr) return;
         const auto at = pointer(address);
-        if (at >= arenaBase && at - arenaBase < arenaBytes) {
-            blocks.insert(at & ~std::uint64_t{FrameCaptureWriter::BlockBytes - 1});
-            return;
-        }
-        const auto page = at & ~std::uint64_t{HostPageBytes - 1};
-        hostPages.insert(page);
-        hostPages.insert(page + HostPageBytes);
+        const bool arena = at >= arenaBase && at - arenaBase < arenaBytes;
+        const auto blockBytes = arena ? FrameCaptureWriter::BlockBytes : HostPageBytes;
+        const auto begin = at & ~std::uint64_t{blockBytes - 1};
+        const auto count = bytes != 0 ? (at - begin + bytes + blockBytes - 1) / blockBytes : 2;
+        auto& pages = arena ? blocks : hostPages;
+        for (std::uint64_t index = 0; index < count; ++index) pages.insert(begin + index * blockBytes);
     };
     for (const auto* shader : shaders) {
         if (shader == nullptr || !GuestMemory::Accessible(shader, sizeof(Shader))) continue;
         note(shader);
+        note(const_cast<const void*>(shader->code), shader->shader_size);
         note(shader->user_data);
         note(shader->cx_registers);
         note(shader->sh_registers);
@@ -317,7 +323,7 @@ void FrameRecorder::emitShaderDelta(std::span<const Shader* const> shaders) {
     std::vector<Span> spans;
     for (const auto block : blocks) {
         const auto found = shaderMarks.find(block);
-        spans.push_back({block, 2 * FrameCaptureWriter::BlockBytes, found != shaderMarks.end() ? std::max(found->second, generation) : generation});
+        spans.push_back({block, FrameCaptureWriter::BlockBytes, found != shaderMarks.end() ? std::max(found->second, generation) : generation});
     }
     const std::vector<std::uint64_t> pages(hostPages.begin(), hostPages.end());
     writeDelta(spans, pages);

@@ -120,7 +120,7 @@ FrameCall decodeCall(FrameCallKind kind, std::span<const std::byte> payload) {
 }
 
 bool knownCall(std::uint32_t kind) {
-    return kind >= static_cast<std::uint32_t>(FrameCallKind::RegisterShader) && kind <= static_cast<std::uint32_t>(FrameCallKind::DisplayBuffer);
+    return kind >= static_cast<std::uint32_t>(FrameCallKind::RegisterShader) && kind <= static_cast<std::uint32_t>(FrameCallKind::UnregisterVideoOutput);
 }
 
 std::vector<std::byte> readFile(const std::filesystem::path& path) {
@@ -164,6 +164,7 @@ std::string_view FrameCallName(FrameCallKind kind) {
     case FrameCallKind::ResolveGraphicsAbi: return "resolve-graphics-abi";
     case FrameCallKind::ResolveGraphicsStagesAbi: return "resolve-graphics-stages-abi";
     case FrameCallKind::RegisterVideoOutput: return "register-video-output";
+    case FrameCallKind::UnregisterVideoOutput: return "unregister-video-output";
     case FrameCallKind::SetTessellationFactorRing: return "set-tf-ring";
     case FrameCallKind::Submit: return "submit";
     case FrameCallKind::Flip: return "flip";

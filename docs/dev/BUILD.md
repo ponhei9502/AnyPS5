@@ -197,7 +197,7 @@ cmake --build build --target agc_frame_replay
 build/core/libs/prx/libSceAgcDriver/agc_frame_replay capture
 ```
 
-On Windows use `agc_frame_replay.exe` and prepend `build/core/libs/libs/unpatched` to the process `PATH`. With `BUILD_TESTING=ON`, `agc_frame_capture` checks the file format (round trip, zero-block elision, truncated and corrupt files) `agc_driver_frame_capture_eop` reserves and submits six EOP flips with `APS5_FRAME_CAPTURE_FRAMES=3` and checks that the capture starts after the first flipping submission and holds three frames of one reservation and one submission each, and `agc_driver_frame_replay` captures two frames of CPU writes followed by DMA copies, replays them in `agc_frame_replay` and compares the copies.
+On Windows use `agc_frame_replay.exe` and prepend `build/core/libs/libs/unpatched` to the process `PATH`. With `BUILD_TESTING=ON`, `agc_frame_capture` checks the file format (round trip, zero-block elision, truncated and corrupt files), and `agc_driver_frame_capture_eop` reserves and submits six EOP flips with `APS5_FRAME_CAPTURE_FRAMES=3` and checks that the capture starts after the first flipping submission and holds three frames of one reservation and one submission each, and `agc_driver_frame_replay` captures two frames of CPU writes followed by DMA copies, replays them in `agc_frame_replay` and compares the copies.
 
 ## Pipeline statistics
 
