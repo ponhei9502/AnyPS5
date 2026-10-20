@@ -25,6 +25,22 @@ std::uint32_t Driver::ReserveEopFlip(const FlipInfo& info) {
     return token;
 }
 
+std::uint32_t Driver::ReserveEopFlipAt(const FlipInfo& info, std::uint32_t token) {
+    {
+        std::lock_guard lock(mutex);
+        require(token >= EopFlipTokenBase && token <= EopFlipTokenLimit && !eopFlips.contains(token), "EOP flip token is not free");
+        nextEopToken = token;
+    }
+    return ReserveEopFlip(info);
+}
+
+std::vector<std::uint32_t> Driver::PendingEopFlipTokens() {
+    std::lock_guard lock(mutex);
+    std::vector<std::uint32_t> tokens;
+    for (const auto& [token, flip] : eopFlips) tokens.push_back(token);
+    return tokens;
+}
+
 void Driver::RegisterVideoOutput(std::uint32_t handle, const std::shared_ptr<IVideoOutput>& output) {
     require(output != nullptr, "null video output");
     std::lock_guard lock(mutex);
