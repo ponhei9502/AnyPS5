@@ -42,6 +42,7 @@ alignas(8) Header VertexHeader{};
 alignas(8) Header PixelHeader{};
 alignas(8) Header TriangleVertexHeader{};
 alignas(8) Header ConstantPixelHeader{};
+alignas(256) std::array<std::uint32_t, 4> IndirectRecord{3, 1, 0, 0};
 
 const Shader* Registered(Header& header, const std::uint32_t* code, std::size_t bytes, std::uint8_t type) {
     header.shader.file_header = 0x34333231u;
@@ -231,6 +232,30 @@ void RetainedPixelCacheTransitions() {
     Require(after.verifyDecodeMismatches == before.verifyDecodeMismatches && after.facadeMismatches == before.facadeMismatches, "cached pixel transitions disagreed with fresh decoding");
 }
 
+void CpuPathIndirectDrawsAreCachedWhenAsked(bool libraries) {
+    const auto mode = std::string(libraries ? "with" : "without") + " graphics pipeline libraries";
+    const bool cached = std::getenv("APS5_DRAW_CACHE_INDIRECT") != nullptr;
+    auto commands = Draws(8.0f, VertexCode.data(), 1, PixelCode.data(), 1, {});
+    Append(commands, 0x76, {0x00c, std::bit_cast<std::uint32_t>(1.0f)});
+    Append(commands, 0x79, {0x24a, 0});
+    const auto records = reinterpret_cast<std::uintptr_t>(IndirectRecord.data());
+    Append(commands, 0x11, {1, static_cast<std::uint32_t>(records), static_cast<std::uint32_t>(records >> 32u)});
+    for (unsigned i = 0; i < 3; ++i) Append(commands, 0x24, {0, 0x8c, 0, 2});
+    const auto notFolded = static_cast<std::size_t>(AgcDriver::Graphics::IndirectDrawPath::NotFolded);
+    const auto pathsBefore = AgcDriver::Graphics::IndirectDrawCounts();
+    const auto before = AgcDriver::DriverDetail::Driver::Get().DrawCacheCounters();
+    const auto after = Submit(commands);
+    const auto pathsAfter = AgcDriver::Graphics::IndirectDrawCounts();
+    if (std::getenv("APS5_PROFILE_DRAW") != nullptr) Require(pathsAfter[notFolded] - pathsBefore[notFolded] == 3, mode + ": " + std::to_string(pathsAfter[notFolded] - pathsBefore[notFolded]) + " of three indirect draws whose packet patches a user word the vertex program reads as a value took the CPU path for an unfolded SGPR, expected 3");
+    Require(after.lookups - before.lookups == 3, mode + ": three CPU-path indirect draws made " + std::to_string(after.lookups - before.lookups) + " draw-cache lookups, expected 3");
+    if (cached) {
+        Require(after.inserts - before.inserts == 1 && after.absent - before.absent == 2, mode + ": with APS5_DRAW_CACHE_INDIRECT, three CPU-path indirect draws inserted " + std::to_string(after.inserts - before.inserts) + " draw entries with " + std::to_string(after.absent - before.absent) + " lookups absent, expected 1 and 2");
+        Require(after.hits - before.hits == 1, mode + ": with APS5_DRAW_CACHE_INDIRECT, the third CPU-path indirect draw did not reuse the cached draw (" + std::to_string(after.hits - before.hits) + " hits)");
+    } else {
+        Require(after.inserts == before.inserts && after.hits == before.hits && after.absent - before.absent == 3, mode + ": without APS5_DRAW_CACHE_INDIRECT, CPU-path indirect draws inserted " + std::to_string(after.inserts - before.inserts) + " draw entries and hit " + std::to_string(after.hits - before.hits) + " times, expected none");
+    }
+}
+
 void SightingsKeepCollidingKeys() {
     DrawKeySightings sightings(DrawKeySightings::Ways);
     Require(!sightings.SeenBefore(0) && sightings.SeenBefore(0), "draw key 0 was not admitted at its second sight");
@@ -260,6 +285,7 @@ int main() {
             UserDataDrawsReuseTheirShape(libraries);
             StageDataHitsRefreshTheirWords(libraries);
             RetainedPixelCacheTransitions();
+            CpuPathIndirectDrawsAreCachedWhenAsked(libraries);
         }
         AgcDriverShutdown_nid_postfix();
         Require(AgcDriver::Graphics::PipelineLibraryWorkers() == 0, "the driver's shutdown left the pipeline library worker running");
