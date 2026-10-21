@@ -380,7 +380,6 @@ private:
     std::shared_ptr<FrameTiming> pendingFrameTiming;
 
     std::atomic<std::uint64_t> flipsCounted{0};
-    std::atomic<std::uint64_t> flipSubmissions{0};
     struct AwaitedSlot {
         std::atomic<std::uint64_t> address{0};
         std::atomic<std::uint64_t> reference{0};

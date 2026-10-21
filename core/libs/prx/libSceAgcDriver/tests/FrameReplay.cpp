@@ -154,11 +154,12 @@ void testCaptureAndReplay(const std::filesystem::path& tool) {
     AgcDriverUnregisterVideoOutput_nid_postfix(Handle, output);
     output = std::make_shared<Output>();
     AgcDriverRegisterVideoOutput_nid_postfix(Handle, output);
-    std::memcpy(layout.source, second.data(), second.size());
-    copyFrame(layout.secondCommands, layout, layout.secondTarget);
+    const auto late = allocate();
+    std::memcpy(late.source, second.data(), second.size());
+    copyFrame(late.firstCommands, late, late.firstTarget);
     flip();
     AgcDriverWaitIdle_nid_postfix();
-    check(equal(layout.firstTarget, first) && equal(layout.secondTarget, second), "the driver did not run the copies while capturing");
+    check(equal(layout.firstTarget, first) && equal(late.firstTarget, second), "the driver did not run the copies while capturing");
 
     const FrameCaptureReader reader(capture);
     check(!reader.Truncated(), "the capture is truncated");
@@ -175,15 +176,19 @@ void testCaptureAndReplay(const std::filesystem::path& tool) {
     check(starts == 1 && submits == 2 && flips == 2, "the capture holds " + std::to_string(submits) + " submits and " + std::to_string(flips) + " flips after " + std::to_string(starts) + " frame starts");
     check(memory >= 2, "the CPU writes before each copy were not recorded as memory deltas");
     check(registrations == 3 && unregistrations == 2, "video output close and reopen was not recorded before and during capture");
-    const auto snapshot = std::any_of(reader.Chunks().begin(), reader.Chunks().end(), [&](const auto& chunk) {
-        return chunk.kind == FrameMemoryKind::Range && chunk.address <= at(layout.base) && at(layout.base) + BlockBytes <= chunk.address + chunk.bytes;
-    });
-    check(snapshot, "the guest block is not in the snapshot ranges");
+    const auto recorded = [&](const std::byte* base) {
+        return std::any_of(reader.Chunks().begin(), reader.Chunks().end(), [&](const auto& chunk) {
+            return chunk.kind == FrameMemoryKind::Range && chunk.address <= at(base) && at(base) + BlockBytes <= chunk.address + chunk.bytes;
+        });
+    };
+    check(recorded(layout.base), "the guest block is not in the snapshot ranges");
+    check(recorded(late.base), "the block committed during the capture is not in its ranges");
+    check(reader.Header().find("\"late_ranges\":1") != std::string::npos, "the capture header does not count one range committed during the capture: " + reader.Header());
 
     const auto firstDump = capture / "first.bin";
     const auto secondDump = capture / "second.bin";
     const auto command = "\"\"" + tool.string() + "\" \"" + capture.string() + "\" --strict --dump " + std::to_string(at(layout.firstTarget)) + ":" + std::to_string(DataBytes) + ":\"" + firstDump.string() +
-                         "\" --dump " + std::to_string(at(layout.secondTarget)) + ":" + std::to_string(DataBytes) + ":\"" + secondDump.string() + "\"\"";
+                         "\" --dump " + std::to_string(at(late.firstTarget)) + ":" + std::to_string(DataBytes) + ":\"" + secondDump.string() + "\"\"";
     const auto code = std::system(command.c_str());
     check(code == 0, "agc_frame_replay exited with " + std::to_string(code));
     check(readFile(firstDump) == first, "the replay did not reproduce the first copy");

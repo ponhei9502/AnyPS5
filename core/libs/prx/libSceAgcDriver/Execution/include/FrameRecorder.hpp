@@ -65,7 +65,7 @@ private:
     void record(FrameCall call, bool prologueCall, std::span<const Shader* const> shaders = {});
     void emitDelta();
     void emitShaderDelta(std::span<const Shader* const> shaders);
-    void writeDelta(std::span<const Span> spans, std::span<const std::uint64_t> hostPages);
+    void writeDelta(std::span<const Span> spans, std::span<const std::uint64_t> hostPages, std::span<const Range> added = {});
     bool triggered();
     void start();
     void finish();
@@ -74,6 +74,7 @@ private:
     bool abandonIfDiskLow();
     std::string header() const;
     std::vector<Range> committedRanges();
+    std::vector<Range> newRanges();
 
     std::filesystem::path directory;
     std::filesystem::path trigger;
@@ -100,6 +101,8 @@ private:
     std::uint64_t recordedCalls = 0;
     std::uint64_t startAttempts = 0;
     std::uint64_t unreadableBytes = 0;
+    std::uint64_t allocationsGeneration = 0;
+    std::uint64_t lateRanges = 0;
     std::vector<std::string> warnings;
     std::chrono::steady_clock::time_point origin;
     std::chrono::steady_clock::time_point startedAt;

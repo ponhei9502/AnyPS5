@@ -43,6 +43,15 @@ bool& submitsQueue0() {
     return HostThreadLocal<bool, SubmitsQueue0Storage>();
 }
 
+std::uint64_t& flipSubmissionsOfThread() {
+    struct FlipSubmissionsStorage {};
+    return HostThreadLocal<std::uint64_t, FlipSubmissionsStorage>();
+}
+
+}
+
+std::uint64_t Driver::FlipSubmissions() const {
+    return flipSubmissionsOfThread();
 }
 
 std::deque<const std::uint32_t*>& Driver::releasedTails() {
@@ -402,7 +411,7 @@ void Driver::Submit(const Packet* packet, std::uint32_t queue, bool cpuFlip) {
             submission.holdsFlip = true;
             flipsAhead.fetch_add(1, std::memory_order_acq_rel);
         }
-        if (!submission.flips.empty()) flipSubmissions.fetch_add(1, std::memory_order_relaxed);
+        if (!submission.flips.empty()) ++flipSubmissionsOfThread();
         enqueue(std::move(submission));
         ++accepted;
     }

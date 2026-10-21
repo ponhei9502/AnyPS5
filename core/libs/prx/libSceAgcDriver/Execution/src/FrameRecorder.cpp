@@ -283,9 +283,38 @@ void FrameRecorder::emitDelta() {
         if (range.kind == FrameRangeKind::Watched || range.kind == FrameRangeKind::Unwatched) spans.push_back({range.address, range.bytes, generation});
     }
     const auto mark = GuestMemory::WriteGeneration();
-    writeDelta(spans, {});
+    const auto added = newRanges();
+    writeDelta(spans, {}, added);
     generation = mark;
     shaderMarks.clear();
+}
+
+std::vector<FrameRecorder::Range> FrameRecorder::newRanges() {
+    const auto current = GuestAllocations::GuestAllocationsGeneration_nid_postfix();
+    if (current == allocationsGeneration) return {};
+    allocationsGeneration = current;
+    std::map<std::uint64_t, std::uint64_t> covered;
+    for (const auto& range : ranges) {
+        auto& end = covered[range.address];
+        end = std::max(end, range.address + range.bytes);
+    }
+    std::vector<Range> added;
+    for (const auto& range : committedRanges()) {
+        const auto end = range.address + range.bytes;
+        for (auto at = range.address; at < end;) {
+            const auto next = covered.upper_bound(at);
+            if (next != covered.begin() && std::prev(next)->second > at) {
+                at = std::prev(next)->second;
+                continue;
+            }
+            auto piece = range;
+            piece.address = at;
+            piece.bytes = (next == covered.end() ? end : std::min(end, next->first)) - at;
+            added.push_back(piece);
+            at += piece.bytes;
+        }
+    }
+    return added;
 }
 
 void FrameRecorder::emitShaderDelta(std::span<const Shader* const> shaders) {
@@ -330,13 +359,33 @@ void FrameRecorder::emitShaderDelta(std::span<const Shader* const> shaders) {
     for (const auto block : blocks) shaderMarks[block] = mark;
 }
 
-void FrameRecorder::writeDelta(std::span<const Span> spans, std::span<const std::uint64_t> hostPages) {
+void FrameRecorder::writeDelta(std::span<const Span> spans, std::span<const std::uint64_t> hostPages, std::span<const Range> added) {
     if (abandonIfDiskLow()) return;
     const auto [accepted, completed] = DriverDetail::Driver::Get().SerialProgress();
     const auto group = deltaGroups + 1;
     bool any = false;
     std::vector<std::pair<std::uint64_t, std::uint64_t>> written;
     std::vector<std::byte> bytes;
+    for (const auto& range : added) {
+        writer->WriteRange(range.address, range.bytes, range.kind, range.protection, range.access);
+        ranges.push_back(range);
+        ++lateRanges;
+        if (!range.readable) {
+            unreadableBytes += range.bytes;
+            continue;
+        }
+        for (std::uint64_t at = 0; at < range.bytes;) {
+            bytes.resize(static_cast<std::size_t>(std::min<std::uint64_t>(FrameCaptureWriter::BlockBytes, range.bytes - at)));
+            GuestMemory::ReadCommittedUnsynced(range.address + at, bytes);
+            const bool zero = std::all_of(bytes.begin(), bytes.end(), [](std::byte value) { return value == std::byte{0}; });
+            if (!zero) {
+                writer->WriteDelta(group, completed, range.address + at, bytes);
+                deltaBytes += bytes.size();
+                any = true;
+            }
+            at += bytes.size();
+        }
+    }
     for (const auto page : hostPages) {
         if (!GuestMemory::Accessible(reinterpret_cast<const void*>(static_cast<std::uintptr_t>(page)), HostPageBytes)) continue;
         bytes.resize(HostPageBytes);
@@ -413,6 +462,7 @@ void FrameRecorder::start() {
     }
     startedAt = std::chrono::steady_clock::now();
     startBoundary = boundaries;
+    allocationsGeneration = GuestAllocations::GuestAllocationsGeneration_nid_postfix();
     ranges = committedRanges();
     writer = std::make_unique<FrameCaptureWriter>(directory);
     std::vector<std::pair<std::uint64_t, std::uint64_t>> written;
@@ -475,7 +525,7 @@ std::string FrameRecorder::header() const {
     text += ",\"arena_base\":" + std::to_string(arenaBase) + ",\"arena_bytes\":" + std::to_string(arenaBytes);
     text += ",\"start_boundary\":" + std::to_string(startBoundary) + ",\"frames\":" + std::to_string(recordedFrames);
     text += ",\"calls\":" + std::to_string(recordedCalls) + ",\"prologue_calls\":" + std::to_string(prologue.size());
-    text += ",\"ranges\":" + std::to_string(ranges.size()) + ",\"snapshot_bytes\":" + std::to_string(snapshotBytes) + ",\"unreadable_bytes\":" + std::to_string(unreadableBytes);
+    text += ",\"ranges\":" + std::to_string(ranges.size()) + ",\"late_ranges\":" + std::to_string(lateRanges) + ",\"snapshot_bytes\":" + std::to_string(snapshotBytes) + ",\"unreadable_bytes\":" + std::to_string(unreadableBytes);
     text += ",\"memory_groups\":" + std::to_string(deltaGroups) + ",\"delta_bytes\":" + std::to_string(deltaBytes);
     text += ",\"capture_seconds\":" + std::to_string(std::chrono::duration<double>(std::chrono::steady_clock::now() - startedAt).count());
     text += ",\"env\":{";

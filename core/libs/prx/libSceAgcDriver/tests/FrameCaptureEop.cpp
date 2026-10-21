@@ -1,4 +1,5 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
 #include "prx/libSceAgcDriver/Execution/include/FrameCapture.hpp"
 #include "prx/libSceAgcDriver/Execution/include/VideoOutput.hpp"
 #include "prx/libSceAgcDriver/Submit/include/Dcb.hpp"
@@ -15,6 +16,7 @@
 #include <memory>
 #include <stdexcept>
 #include <string>
+#include <thread>
 #ifdef _WIN32
 #include <windows.h>
 #endif
@@ -108,11 +110,34 @@ void testEopFramesCountOnce() {
           "the captured frames hold " + std::to_string(submits) + " submissions and " + std::to_string(reservations) + " reservations, expected " + std::to_string(CapturedFrames) + " of each");
 }
 
+void testFlipsCountPerThread() {
+    auto* const block = allocate();
+    const auto& driver = AgcDriver::DriverDetail::Driver::Get();
+    const auto before = driver.FlipSubmissions();
+    std::uint64_t otherBefore = 0, otherAfter = 0;
+    std::exception_ptr failure;
+    std::thread submitter([&] {
+        try {
+            otherBefore = driver.FlipSubmissions();
+            submitEopFrame(block, 0);
+            otherAfter = driver.FlipSubmissions();
+        } catch (...) {
+            failure = std::current_exception();
+        }
+    });
+    submitter.join();
+    if (failure) std::rethrow_exception(failure);
+    AgcDriverWaitIdle_nid_postfix();
+    check(otherAfter == otherBefore + 1, "the flipping submission did not count on the thread that made it");
+    check(driver.FlipSubmissions() == before, "a flip submitted on another thread changed this thread's flip count, so a submission of this thread that overlaps it would end a captured frame");
+}
+
 }
 
 int main() {
     try {
         testEopFramesCountOnce();
+        testFlipsCountPerThread();
     } catch (const std::exception& error) {
         std::fprintf(stderr, "FAILED: %s\n", error.what());
         return 1;

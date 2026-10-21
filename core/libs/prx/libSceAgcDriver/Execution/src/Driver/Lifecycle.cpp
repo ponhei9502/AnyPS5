@@ -276,10 +276,6 @@ std::vector<AwaitedWait> Driver::AwaitedWaits() {
     return result;
 }
 
-std::uint64_t Driver::FlipSubmissions() const {
-    return flipSubmissions.load(std::memory_order_relaxed);
-}
-
 std::pair<std::uint64_t, std::uint64_t> Driver::SerialProgress() {
     std::lock_guard lock(mutex);
     return {accepted, completed};
