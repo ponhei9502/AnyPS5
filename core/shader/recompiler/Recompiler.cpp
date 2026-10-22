@@ -517,7 +517,7 @@ std::shared_ptr<const IrResourcePlan> planOf(SourceEntry& source, const Recompil
 
 bool sameLayout(const BindingLayout& left, const BindingLayout& right);
 
-std::shared_ptr<SourceEntry> getSource(const RecompileRequest& request, ShaderPreparationContext* preparation = nullptr, bool reclaim = true, const SourceHandle* preparedHandle = nullptr) {
+std::shared_ptr<SourceEntry> getSource(const RecompileRequest& request, ShaderPreparationContext* preparation = nullptr, bool reclaim = true, const SourceHandle* preparedHandle = nullptr, bool loadPlan = true) {
     static PrimedSharedMutex mutex;
     // Entries whose code hashes alike share a bucket; the code comparison picks the right one.
     static std::unordered_map<std::vector<std::uint64_t>, std::vector<std::shared_ptr<SourceEntry>>, SourceKeyHash> sources;
@@ -557,7 +557,7 @@ std::shared_ptr<SourceEntry> getSource(const RecompileRequest& request, ShaderPr
             bucket.push_back(source);
         }
     }
-    {
+    if (loadPlan) {
         ensurePlan(*source, request, preparation, reclaim);
     }
     source->lastUse.store(nowMs(), std::memory_order_relaxed);
@@ -1310,7 +1310,7 @@ struct PreparedInterface {
 
 namespace {
 
-std::shared_ptr<const CompiledVariant> findOrCompileVariant(SourceEntry& source, const RecompileRequest& request, bool& cacheHit, ShaderPreparationContext* preparation = nullptr) {
+std::shared_ptr<const CompiledVariant> findOrCompileVariant(SourceEntry& source, const RecompileRequest& request, bool& cacheHit, ShaderPreparationContext* preparation = nullptr, bool planDeferred = false) {
     for (const auto& candidate : source.variants) {
         if (sameLayout(candidate->layout, request.layout)) {
             cacheHit = true;
@@ -1334,6 +1334,7 @@ std::shared_ptr<const CompiledVariant> findOrCompileVariant(SourceEntry& source,
         }
     }
     if (variant == nullptr) {
+        if (planDeferred) ensurePlan(source, request, preparation, false);
         static const bool layoutPair = std::getenv("APS5_NO_PERF_LAYOUT_PAIR") == nullptr;
         std::exception_ptr emissionFailure;
         try {
@@ -1668,12 +1669,13 @@ std::shared_ptr<const SourceHandle> PrepareShader(const RecompileRequest& reques
     return recompileReporting(request, [&]() -> std::shared_ptr<const SourceHandle> {
         static_cast<void>(RequestInputInfo(request));
         auto handle = std::make_shared<SourceHandle>();
-        handle->source = getSource(request, preparation, false);
+        const bool deferPlan = PlanEvict();
+        handle->source = getSource(request, preparation, false, nullptr, !deferPlan);
         RecompileCacheKey::BuildInterface(request, handle->staticKey);
         handle->staticKey.push_back(HostSubgroupSize(request));
         bool cacheHit = false;
         std::lock_guard lock(handle->source->mutex);
-        handle->artifact = findOrCompileVariant(*handle->source, request, cacheHit, preparation);
+        handle->artifact = findOrCompileVariant(*handle->source, request, cacheHit, preparation, deferPlan);
         return handle;
     });
 }
