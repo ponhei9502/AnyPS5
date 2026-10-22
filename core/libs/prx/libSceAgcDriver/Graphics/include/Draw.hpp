@@ -95,6 +95,8 @@ struct DrawRecipeOutcome {
 DrawRecipeOutcome DrawWithRecipe(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, std::span<const GuestMemorySnapshot> snapshots, const DrawRecipe& recipe);
 // Whether recorded draws build recipes and draw-cache hits use them (APS5_NO_DRAW_RECIPE unset).
 bool DrawRecipes();
+// Local (F13 item 3): whether a CPU-path indirect draw's records use recipes (APS5_INDIRECT_RECIPES set); the record's push block then comes from the current shaders, not the recipe's.
+bool IndirectRecipes();
 
 // How an indirect draw's records were read, for the [draws] line (APS5_PROFILE_DRAW): Gpu is
 // vkCmdDrawIndirect from the host import; every other value names why the CPU read them instead,

@@ -1117,6 +1117,11 @@ bool DrawRecipes() {
     return !noDrawRecipe;
 }
 
+bool IndirectRecipes() {
+    static const bool on = std::getenv("APS5_INDIRECT_RECIPES") != nullptr;   // Local (F13 item 3)
+    return on;
+}
+
 const char* DrawRecipeMissName(DrawRecipeMiss miss) {
     constexpr std::array<const char*, static_cast<std::size_t>(DrawRecipeMiss::Count)> names{"none", "not recordable", "target gone", "template gone", "objects gone", "proof"};
     return names[static_cast<std::size_t>(miss)];
@@ -3275,7 +3280,10 @@ DrawRecipeOutcome DrawWithRecipe(const Context& context, const State& state, con
     record.targetViews = recipe.targetViews;
     record.targets = std::move(targets);
     for (const auto& color : state.colors) record.targetSlices.emplace_back(color.arraySlice, color.arrayLastSlice != 0 ? color.layers : 1u);
-    record.pushBytes = &recipe.pushBytes;
+    // Local (F13 item 3): a CPU-path indirect draw's records differ from the recipe's draw only in their user-data push words
+    // (and in `draw`), so with APS5_INDIRECT_RECIPES the push block is assembled from the current shaders (pushDrawConstants
+    // does that for a null pointer and recomputes the stage mask); the recipe's baked block serves direct draws as before.
+    record.pushBytes = IndirectRecipes() ? nullptr : &recipe.pushBytes;
     record.pushStages = recipe.pushStages;
     record.depthLocations = passDepthLocations(context, state, *record.pipeline);
     recordDraw(context, state, draw, shaders, inputs, record, outcome, timer, ownWaitedMs);
