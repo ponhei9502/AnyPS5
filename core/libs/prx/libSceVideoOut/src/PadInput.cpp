@@ -254,6 +254,8 @@ void PadInput::Update(const DisplayWindow& window) {
     }
     const bool changed = keyboardMouse.Advance(std::chrono::steady_clock::now());
     if (controller != nullptr || keyboardMouse.MouseMode() || changed) publish(window.FrameNumber());
+    // Pad: publish every update when an input script is active and no controller is connected so scripted presses reach the title.
+    if (!controller && std::getenv("APS5_INPUT_SCRIPT") != nullptr) publish(window.FrameNumber());
 }
 
 void PadInput::publish(std::uint64_t frame) {
