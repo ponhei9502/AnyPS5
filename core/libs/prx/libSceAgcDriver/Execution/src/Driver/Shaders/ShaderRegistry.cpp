@@ -1446,7 +1446,10 @@ public:
     static RegistrationPreparePool& Instance() {
         static auto* pool = [] {
             std::lock_guard lifecycle(Lifecycle());
-            auto* created = new RegistrationPreparePool(Closing() ? 0u : std::max(2u, std::thread::hardware_concurrency() / 2u));
+            const char* text = std::getenv("APS5_PREPARE_THREADS");
+            const auto count = text != nullptr ? std::max(1u, static_cast<unsigned>(std::strtoul(text, nullptr, 10))) : std::max(2u, std::thread::hardware_concurrency() / 2u);
+            std::fprintf(stderr, "[shader-prepare] registration preparation pool: %u threads%s\n", count, text != nullptr ? " (APS5_PREPARE_THREADS)" : "");
+            auto* created = new RegistrationPreparePool(Closing() ? 0u : count);
             PreparationSlot().store(created);
             return created;
         }();
