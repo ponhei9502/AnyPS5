@@ -1,4 +1,5 @@
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -6,6 +7,7 @@
 #include <stdexcept>
 #include <string>
 #include <utility>
+#include <vector>
 
 #include "SDL.h"
 #include "prx/libSceVideoOut/include/PadInput.hpp"
@@ -18,10 +20,96 @@
 #include "prx/libc/include/General.hpp"
 #include "prx/libSceIme/include/ImeInput.hpp"
 
+namespace {
+
+// APS5_PAD_SCRIPT="cross@30+6,down@300+0.2": pad buttons held from a time after start (seconds) for a
+// duration, ORed into the published state, so an unattended run can press buttons whatever the
+// window focus.
+std::uint32_t ButtonNamed(const std::string& name);
+
+struct ScriptedPress {
+    std::uint32_t button = 0;
+    double from = 0;
+    double until = 0;
+};
+
+const std::vector<ScriptedPress>& ScriptedPresses() {
+    static const std::vector<ScriptedPress> presses = [] {
+        std::vector<ScriptedPress> parsed;
+        const char* text = std::getenv("APS5_PAD_SCRIPT");
+        if (text == nullptr) return parsed;
+        std::string script = text;
+    std::size_t cursor = 0;
+        while (cursor < script.size()) {
+            const auto comma = script.find(',', cursor);
+            const auto entry = script.substr(cursor, comma == std::string::npos ? std::string::npos : comma - cursor);
+            cursor = comma == std::string::npos ? script.size() : comma + 1;
+            const auto at = entry.find('@');
+            const auto plus = entry.find('+', at == std::string::npos ? 0 : at);
+            if (at == std::string::npos || plus == std::string::npos) throw std::runtime_error("APS5_PAD_SCRIPT entry '" + entry + "' is not button@seconds+seconds");
+            const auto from = std::strtod(entry.c_str() + at + 1, nullptr);
+            parsed.push_back({ButtonNamed(entry.substr(0, at)), from, from + std::strtod(entry.c_str() + plus + 1, nullptr)});
+        }
+        return parsed;
+    }();
+    return presses;
+}
+
+std::uint32_t ButtonNamed(const std::string& name) {
+    const std::pair<const char*, Pad::PadButton> names[] = {{"cross", Pad::PadButton::Cross}, {"circle", Pad::PadButton::Circle}, {"square", Pad::PadButton::Square}, {"triangle", Pad::PadButton::Triangle}, {"options", Pad::PadButton::Options}, {"up", Pad::PadButton::Up}, {"down", Pad::PadButton::Down}, {"left", Pad::PadButton::Left}, {"right", Pad::PadButton::Right}, {"l1", Pad::PadButton::L1}, {"r1", Pad::PadButton::R1}};
+    const auto found = std::find_if(std::begin(names), std::end(names), [&](const auto& candidate) { return name == candidate.first; });
+    if (found == std::end(names)) throw std::runtime_error("scripted pad input names an unknown button '" + name + "'");
+    return static_cast<std::uint32_t>(found->second);
+}
+
+// APS5_PAD_COMMAND_FILE=<path>: a controlling script writes "<button> <seconds>" lines there; each
+// line holds the button from when it is read, and the file is removed once read.
+std::vector<ScriptedPress>& CommandedPresses() {
+    static std::vector<ScriptedPress> presses;
+    return presses;
+}
+
+void ReadPadCommands(double seconds) {
+    static const char* path = std::getenv("APS5_PAD_COMMAND_FILE");
+    static auto nextPoll = std::chrono::steady_clock::time_point{};
+    if (path == nullptr) return;
+    const auto now = std::chrono::steady_clock::now();
+    if (now < nextPoll) return;
+    nextPoll = now + std::chrono::milliseconds(100);
+    std::FILE* file = std::fopen(path, "rb");
+    if (file == nullptr) return;
+    char line[128];
+    while (std::fgets(line, sizeof(line), file) != nullptr) {
+        char name[32]{};
+        double duration = 0;
+        if (std::sscanf(line, "%31s %lf", name, &duration) == 2) CommandedPresses().push_back({ButtonNamed(name), seconds, seconds + duration});
+    }
+    std::fclose(file);
+    std::remove(path);
+}
+
+std::uint32_t ScriptedButtons() {
+    static const auto started = std::chrono::steady_clock::now();
+    const auto seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count();
+    ReadPadCommands(seconds);
+    std::uint32_t buttons = 0;
+    for (const auto& press : ScriptedPresses()) {
+        if (press.from <= seconds && seconds < press.until) buttons |= press.button;
+    }
+    for (const auto& press : CommandedPresses()) {
+        if (press.from <= seconds && seconds < press.until) buttons |= press.button;
+    }
+    return buttons;
+}
+
+}  // namespace
+
 PadInput::PadInput() : PadInput(Pad::LoadInputMapping()) {
+    static_cast<void>(ScriptedButtons());
 }
 
 PadInput::PadInput(Pad::InputConfiguration configuration) : keyboardMouse(std::move(configuration)) {
+    static_cast<void>(ScriptedButtons());
     openFirstAvailableController();
 }
 
@@ -254,12 +342,17 @@ void PadInput::Update(const DisplayWindow& window) {
     }
     const bool changed = keyboardMouse.Advance(std::chrono::steady_clock::now());
     if (controller != nullptr || keyboardMouse.MouseMode() || changed) publish(window.FrameNumber());
-    // Pad: publish every update when an input script is active and no controller is connected so scripted presses reach the title.
-    if (!controller && std::getenv("APS5_INPUT_SCRIPT") != nullptr) publish(window.FrameNumber());
+    // Scripted/Commanded pad presses are read in ScriptedButtons(); without a controller nothing else
+    // calls publish(), so poll them on every update and publish when the scripted state changes.
+    const auto scripted = ScriptedButtons();
+    const bool scriptChanged = scripted != padScriptButtons;
+    padScriptButtons = scripted;
+    if (scriptChanged || (!controller && std::getenv("APS5_INPUT_SCRIPT") != nullptr)) publish(window.FrameNumber());
 }
 
 void PadInput::publish(std::uint64_t frame) {
-    const auto state = keyboardMouse.Compose(controllerState);
+    auto state = keyboardMouse.Compose(controllerState);
+    state.buttons |= ScriptedButtons();
     PadPublishInput_nid_postfix(state);
     if (auto* telemetry = VideoOutTelemetry::Instance(); telemetry != nullptr) VideoOutTelemetry::EmitPadIfChanged(*telemetry, telemetryFilter, frame, state);
 }

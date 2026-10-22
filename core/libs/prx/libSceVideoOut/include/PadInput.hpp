@@ -40,6 +40,7 @@ private:
     std::chrono::steady_clock::time_point nextRumbleRefresh{};
     LightBarPacer lightBar;
     TriggerEffectCache triggerEffect;
+    std::uint32_t padScriptButtons = 0;
 };
 
 #endif
