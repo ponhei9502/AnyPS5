@@ -437,8 +437,20 @@ void Driver::execute(const Submission& submission) {
                     timed(&WorkerProfile::dispatchMs, [&] { resolveGroupAhead(submission, queue, cursor); });
                 }
             }
-            if (opcode == 0x15) timed(&WorkerProfile::dispatchMs, [&] { dispatch(queue, packet, submission); });
-            else timed(&WorkerProfile::dispatchMs, [&] { dispatchIndirect(queue, packet, submission); });
+            try {
+                if (opcode == 0x15) timed(&WorkerProfile::dispatchMs, [&] { dispatch(queue, packet, submission); });
+                else timed(&WorkerProfile::dispatchMs, [&] { dispatchIndirect(queue, packet, submission); });
+            } catch (const std::exception& error) {
+                // Local (#1787): a dispatch whose table pointer is still NULL reads "guest memory is not
+                // readable at 0x<small>". Skip that dispatch instead of terminating the title.
+                const std::string reason = error.what();
+                const auto at = reason.find("guest memory is not readable at 0x");
+                if (at == std::string::npos || std::strtoull(reason.c_str() + at + 34, nullptr, 16) >= 0x10000) throw;
+                static std::atomic<unsigned> skipped{0};
+                const auto count = ++skipped;
+                if (count <= 20 || (count & (count - 1)) == 0)
+                    std::fprintf(stderr, "[dispatch] skipped #%u (null table): %s\n", count, reason.c_str());
+            }
             Pm4::NoteDispatchRegisters(packet, queue);
             Graphics::Recorder::CountRecordedWork();
             finishDispatchPacket(opcode == 0x16);
