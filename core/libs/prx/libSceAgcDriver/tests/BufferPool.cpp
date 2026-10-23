@@ -388,6 +388,31 @@ void Budget() {
     Expect(MemoryOf(probe.Handle()) != first, "the least recently used device buffer survived the eviction");
 }
 
+void AddressAndHostUnchanged() {
+    mock = MockDevice{};
+    auto context = mockContext();
+    VkDeviceMemory scratch = VK_NULL_HANDLE;
+    {
+        DeviceBuffer buffer(context, 2 * MiB, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT);
+        scratch = MemoryOf(buffer.Handle());
+    }
+    Buffer addressed(context, 2 * MiB, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+    Expect(MemoryOf(addressed.Handle()) != scratch && addressed.DeviceAddress() != 0, "an addressable device-local buffer took a scratch buffer without a device address");
+    Buffer shadow(context, 2 * MiB - 256, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+    Expect(MemoryOf(shadow.Handle()) == scratch, "a device-local staging buffer did not share the scratch buffers' class");
+    VkBuffer host = VK_NULL_HANDLE;
+    {
+        Buffer copy(context, 10 * MiB + 4096, VK_BUFFER_USAGE_TRANSFER_SRC_BIT, HostVisible);
+        host = copy.Handle();
+        Expect(mock.sizes.at(host) == 10 * MiB + 4096, "a large host buffer was rounded to a class");
+        Expect(mock.usages.at(host) == VK_BUFFER_USAGE_TRANSFER_SRC_BIT, "a host buffer was created with more usages than asked");
+    }
+    Buffer other(context, 10 * MiB + 8192, VK_BUFFER_USAGE_TRANSFER_SRC_BIT, HostVisible);
+    Expect(other.Handle() != host, "a large host buffer of another exact size was reused");
+    Buffer same(context, 10 * MiB + 4096, VK_BUFFER_USAGE_TRANSFER_SRC_BIT, HostVisible);
+    Expect(same.Handle() == host, "a large host buffer of the same exact size was not reused");
+}
+
 void AddressAndHostClasses() {
     mock = MockDevice{};
     auto context = mockContext();
@@ -1020,11 +1045,6 @@ void ImageMemoryReuse() {
 }
 
 int main(int argc, char** argv) {
-#ifdef _WIN32
-    _putenv_s("APS5_HOST_BUFFER_CLASSES", "1");
-#else
-    setenv("APS5_HOST_BUFFER_CLASSES", "1", 1);
-#endif
     try {
         if (argc == 2 && std::string_view(argv[1]) == "--small-device-retention") {
             SmallDeviceRetention();
@@ -1045,7 +1065,8 @@ int main(int argc, char** argv) {
         KeptUntilFence();
         SmallDeviceRetention();
         Budget();
-        AddressAndHostClasses();
+        if (const char* classes = std::getenv("APS5_HOST_BUFFER_CLASSES"); classes != nullptr && !(classes[0] == '0' && classes[1] == '\0')) AddressAndHostClasses();
+        else AddressAndHostUnchanged();
         SmallDeviceClasses();
         SlabMetadataFailure();
         SlabMapFailure();

@@ -545,11 +545,6 @@ void ExactSizes(const Context& context) {
 }
 
 int main(int argc, char** argv) {
-#ifdef _WIN32
-    _putenv_s("APS5_HOST_BUFFER_CLASSES", "1");
-#else
-    setenv("APS5_HOST_BUFFER_CLASSES", "1", 1);
-#endif
     try {
         std::unique_ptr<Device> device;
         try {
