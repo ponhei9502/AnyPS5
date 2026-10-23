@@ -4397,6 +4397,12 @@ void noteDispatchMoveSize(std::size_t bytes) {
     moves.sizes[bucket].fetch_add(1, std::memory_order_relaxed);
 }
 
+// B29a (10-23): why VulkanDevice::dispatch built no recipe, the first failing condition; printed with the [recipe] lines.
+namespace {
+std::array<std::array<std::atomic<std::uint64_t>, 7>, 2> dispatchRecipeSkips{};   // [direct, indirect][6 reasons + built]
+constexpr std::array<const char*, 7> DispatchRecipeSkipNames{"uncacheable", "overlay", "not reusable", "needs completion", "no objects", "no content key", "built"};
+}
+
 void reportRecipes() {
     auto& recipes = Recipes();
     const auto nowMs = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
@@ -4427,6 +4433,14 @@ void reportRecipes() {
         const auto proofUs = perHit(counters.proofNs);
         const auto recordUs = perHit(counters.recordNs);
         AgcDriver::ProfilePrint_nid_no_patch("[recipe] %s (10 s): hits %llu; pre-check misses: %s; proofs: %s; rebuilds: %s; presyncs from the recipe %llu (recomputed %llu, waited %llu); data refreshes recorded %llu / skipped by hash %llu (%llu decided by words: data hits); restarts %llu, attaches %llu; us per hit: pre-check %.1f, proof %.1f, record %.1f; verified %llu (object replaced %llu)\n", kind == 0 ? "dispatch" : kind == 1 ? "indirect" : "draw", hits, misses.c_str(), proofs.c_str(), rebuilds.c_str(), take(counters.presyncsFromRecipe), take(counters.presyncsRecomputed), take(counters.presyncWaits), take(counters.dataRefreshed), take(counters.dataSkipped), take(counters.refreshByWords), take(counters.restarts), take(counters.attaches), precheckUs, proofUs, recordUs, take(counters.verified), take(counters.verifyReplaced));
+    }
+    for (std::size_t kind = 0; kind < 2; ++kind) {   // B29a: same kinds as the [recipe] dispatch / indirect lines
+        std::string skips; char text[64];
+        for (std::size_t i = 0; i < DispatchRecipeSkipNames.size(); ++i) {
+            std::snprintf(text, sizeof(text), "%s%s %llu", i == 0 ? "" : ", ", DispatchRecipeSkipNames[i], static_cast<unsigned long long>(dispatchRecipeSkips[kind][i].exchange(0, std::memory_order_relaxed)));
+            skips += text;
+        }
+        AgcDriver::ProfilePrint_nid_no_patch("[recipe-skip] %s (10 s): %s\n", kind == 0 ? "dispatch" : "indirect", skips.c_str());
     }
 }
 
@@ -5573,6 +5587,10 @@ VulkanDevice::IndirectOutcome VulkanDevice::recordCompletedDispatch(const Shader
     // object the resource cache serves under this content key (reusable: no lease, no copied
     // writes, every direct region import- or mirror-served), so a hit's proof is the template's
     // Revalidate and nothing needs completion work.
+    if (recipeOut != nullptr && DispatchRecipes()) {   // B29a: count the first condition that keeps the recipe from being built
+        const int skip = !cacheable ? 0 : overlay != nullptr ? 1 : !resources->Reusable() ? 2 : resources->NeedsCompletion() ? 3 : objects == nullptr ? 4 : contentKey.empty() ? 5 : -1;
+        dispatchRecipeSkips[arguments != 0 ? 1 : 0][skip >= 0 ? static_cast<std::size_t>(skip) : 6].fetch_add(1, std::memory_order_relaxed);   // 6 = built
+    }
     if (recipeOut != nullptr && DispatchRecipes() && cacheable && overlay == nullptr && resources->Reusable() && !resources->NeedsCompletion() && objects != nullptr && !contentKey.empty()) {
         auto recipe = std::make_shared<Recipe>();
         recipe->device = state->device;
