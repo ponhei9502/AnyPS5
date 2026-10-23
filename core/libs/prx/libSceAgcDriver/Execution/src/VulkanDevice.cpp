@@ -3262,8 +3262,20 @@ struct FrameDumps {
     int limit;
     bool cpu;
     int every = 1;
+    std::int64_t periodMs = 0;
     int dumped = 0;
     std::uint64_t presents = 0;
+    std::int64_t lastDumpMs = -1;
+
+    bool Due() {
+        if (dumped >= limit) return false;
+        ++presents;
+        if (periodMs <= 0) return presents % static_cast<std::uint64_t>(every) == 0;
+        const auto now = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+        if (lastDumpMs >= 0 && now - lastDumpMs < periodMs) return false;
+        lastDumpMs = now;
+        return true;
+    }
 };
 
 FrameDumps& Dumps() {
@@ -3273,6 +3285,9 @@ FrameDumps& Dumps() {
     }(), std::getenv("APS5_NO_GPU_DUMP") != nullptr, [] {
         const char* value = std::getenv("APS5_DUMP_FRAMES_EVERY");
         return value ? std::max(std::atoi(value), 1) : 1;
+    }(), [] {
+        const char* value = std::getenv("APS5_DUMP_FRAMES_SECONDS");
+        return value ? std::int64_t{std::max(std::atoi(value), 0)} * 1000 : std::int64_t{0};
     }()};
     return dumps;
 }
@@ -3290,7 +3305,7 @@ bool VulkanDevice::PresentDisplayBuffer(const DisplayBuffer& buffer) {
         if (passthrough) ensureHdrScaler(DisplayTexelFormat(buffer.pixelFormat));
         const auto pixels = passthrough ? ReadDisplayBufferTexels(buffer) : ReadDisplayBuffer(buffer);
         bool dumpFrame = false;
-        if (frameDumpOutput.Enabled_nid_no_patch() && dumps.dumped < dumps.limit && ++dumps.presents % static_cast<std::uint64_t>(dumps.every) == 0) {
+        if (frameDumpOutput.Enabled_nid_no_patch() && dumps.Due()) {
             if (passthrough) {
                 WriteFrameBmp(dumps.dumped++, buffer.width, buffer.height, ReadDisplayBuffer(buffer), DumpScale());
             } else if (dumps.cpu) {
@@ -3352,7 +3367,7 @@ bool VulkanDevice::PresentDisplayBuffer(const DisplayBuffer& buffer) {
     }
     const auto cleared = buffer.dccAddress != 0 && resident == nullptr ? CompressedClearPixel(buffer, bytes) : std::nullopt;
     bool dumpFrame = false;
-    if (frameDumpOutput.Enabled_nid_no_patch() && dumps.dumped < dumps.limit && ++dumps.presents % static_cast<std::uint64_t>(dumps.every) == 0) {
+    if (frameDumpOutput.Enabled_nid_no_patch() && dumps.Due()) {
         if (dumps.cpu || (passthrough && resident == nullptr)) {
             WriteFrameBmp(dumps.dumped++, buffer.width, buffer.height, DisplayPixels(buffer, cleared), DumpScale());
         } else {

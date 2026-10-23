@@ -10,6 +10,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <exception>
+#include <filesystem>
 #include <fstream>
 #include <iterator>
 #include <mutex>
@@ -39,6 +40,7 @@ const std::uint32_t DumpHeight = Height / Scale;
 const std::size_t DumpBytes = 54 + static_cast<std::size_t>(DumpWidth) * DumpHeight * 4;
 constexpr int Frames = 4;
 bool WaitMode = false;
+bool SecondsMode = false;
 
 void check(bool condition, const char* reason) {
     if (!condition) throw std::runtime_error(reason);
@@ -142,7 +144,7 @@ void testDumpQueue() {
     check(sceVideoOutRegisterBuffers2(handle, 0, 0, &tiledBuffer, 1, &tiledAttribute, 0, nullptr) == 0, "tiled buffer registration failed");
     check(sceVideoOutRegisterBuffers2(handle, 1, 1, &linearBuffer, 1, &linearAttribute, 0, nullptr) == 0, "linear buffer registration failed");
     const HeldDump first(0);
-    const HeldDump last(Frames - 1);
+    const HeldDump last(SecondsMode ? 1 : Frames - 1);
     std::vector<char> firstDump;
     std::thread reader;
     const auto started = std::chrono::steady_clock::now();
@@ -154,6 +156,7 @@ void testDumpQueue() {
     try {
         for (int frame = 0; frame < Frames; ++frame) {
             const int index = frame % 2;
+            if (SecondsMode && frame == Frames - 1) std::this_thread::sleep_for(std::chrono::milliseconds(2200));
             check(sceVideoOutSubmitFlip(handle, index, 1, frame) == 0, "the flip was not accepted");
             std::unique_lock lock(cfg->mutex);
             check(cfg->vblankCond.wait_for(lock, std::chrono::seconds(15), [&] { return (cfg->failure && cfg->flipStatus.flipPendingNum == 0) || cfg->flipStatus.count == static_cast<std::uint64_t>(frame) + 1; }), "the flip did not complete");
@@ -169,23 +172,29 @@ void testDumpQueue() {
     checkDump(firstDump, tiledPixels);
     const auto lastDump = last.Release();
     checkDump(lastDump, linearPixels);
-    checkDump(readDump(1), linearPixels);
-    checkDump(readDump(2), tiledPixels);
+    if (!SecondsMode) {
+        checkDump(readDump(1), linearPixels);
+        checkDump(readDump(2), tiledPixels);
+    }
     sceVideoOutUnregisterBuffers(handle, 0);
     sceVideoOutUnregisterBuffers(handle, 1);
     sceVideoOutClose(handle);
     LibcRunShutdown_nid_postfix();
+    if (SecondsMode) {
+        for (int frame = 2; frame < Frames; ++frame) check(!std::filesystem::exists(frameName(frame)), "a present inside the dump period was dumped");
+    }
 }
 
 }
 
 int main(int argc, char** argv) {
     WaitMode = argc > 1 && std::strcmp(argv[1], "wait") == 0;
+    SecondsMode = argc > 1 && std::strcmp(argv[1], "seconds") == 0;
     VideoOutTestEnvironment environment;
     try {
         if (WaitMode) check(Scale == 1, "the wait test needs APS5_DUMP_SCALE=1");
         testDumpQueue();
-        std::puts(WaitMode ? "VideoOut frame dump wait test passed" : "VideoOut frame dump queue test passed");
+        std::puts(WaitMode ? "VideoOut frame dump wait test passed" : SecondsMode ? "VideoOut frame dump seconds test passed" : "VideoOut frame dump queue test passed");
         return 0;
     } catch (const std::exception& error) {
         std::fprintf(stderr, "%s\n", error.what());
