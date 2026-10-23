@@ -479,8 +479,14 @@ std::int64_t PlanEvictSweepMs() {
     return milliseconds;
 }
 
-void ensurePlan(SourceEntry& source, const RecompileRequest& request, ShaderPreparationContext* preparation, bool reclaim) {
+bool sameLayout(const BindingLayout& left, const BindingLayout& right);
+
+// Caller holds source.mutex. The rules are upstream's (#6178): a prepared artifact must belong to this source, and a
+// rebuilt plan keeps the full IR program only when no variant for the request's layout exists yet (B18).
+void ensurePlan(SourceEntry& source, const RecompileRequest& request, ShaderPreparationContext* preparation, bool reclaim, const SourceHandle* preparedHandle = nullptr) {
     if (source.plan.load() != nullptr) return;
+    const bool hasPreparedArtifact = preparedHandle != nullptr && preparedHandle->artifact != nullptr;
+    if (hasPreparedArtifact && (preparedHandle->source.get() != &source || !MatchesPreparedShader(request, *preparedHandle))) throw std::runtime_error("ShaderRecompiler: prepared artifact does not match the resource plan source");
     if (FailureMemo() && source.planFailure) std::rethrow_exception(source.planFailure);
     const bool disk = diskPlans();
     std::vector<std::byte> planKey;
@@ -497,7 +503,9 @@ void ensurePlan(SourceEntry& source, const RecompileRequest& request, ShaderPrep
         try {
             ResourceProgram resource(request, preparation, reclaim);
             built = std::move(resource.plan);
-            if (source.program == nullptr) source.program = std::move(resource.program);
+            if (!hasPreparedArtifact && std::ranges::none_of(source.variants, [&](const auto& variant) { return sameLayout(variant->layout, request.layout); })) {
+                source.program = std::move(resource.program);
+            }
             source.plan.store(built);
         } catch (...) {
             if (FailureMemo()) source.planFailure = std::current_exception();
@@ -514,8 +522,6 @@ std::shared_ptr<const IrResourcePlan> planOf(SourceEntry& source, const Recompil
     ensurePlan(source, request, nullptr, true);
     return source.plan.load();
 }
-
-bool sameLayout(const BindingLayout& left, const BindingLayout& right);
 
 std::shared_ptr<SourceEntry> getSource(const RecompileRequest& request, ShaderPreparationContext* preparation = nullptr, bool reclaim = true, const SourceHandle* preparedHandle = nullptr, bool loadPlan = true) {
     static PrimedSharedMutex mutex;
@@ -558,7 +564,8 @@ std::shared_ptr<SourceEntry> getSource(const RecompileRequest& request, ShaderPr
         }
     }
     if (loadPlan) {
-        ensurePlan(*source, request, preparation, reclaim);
+        std::lock_guard lock(source->mutex);
+        ensurePlan(*source, request, preparation, reclaim, preparedHandle);
     }
     source->lastUse.store(nowMs(), std::memory_order_relaxed);
     if (PlanEvict()) {
