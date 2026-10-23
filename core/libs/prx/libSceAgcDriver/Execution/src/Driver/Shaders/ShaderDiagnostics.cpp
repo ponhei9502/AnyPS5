@@ -71,6 +71,16 @@ std::string Driver::dumpRequest(std::uint64_t address, const ShaderRecompiler::R
 }
 
 std::string Driver::dumpRequestVariant(std::uint64_t address, const ShaderRecompiler::RecompileRequest& request, std::string_view suffix) {
+    static std::mutex variantMutex;
+    static std::set<std::string> variantDumped;
+    static std::set<std::uint64_t> serializedErrors;
+    static const int dumpLimit = [] {
+        const char* text = std::getenv("APS5_DUMP_GRAPHICS_LIMIT");
+        return text ? std::atoi(text) : 2000;
+    }();
+    static std::size_t dumpCount = 0;
+    static bool limitAnnounced = false;
+
     try {
         const auto text = ShaderRecompiler::RequestSerializer{}.Serialize(request);
         const auto h = std::hash<std::string>{}(text);
@@ -79,20 +89,58 @@ std::string Driver::dumpRequestVariant(std::uint64_t address, const ShaderRecomp
         char hash[17];
         std::snprintf(hash, sizeof(hash), "%016llx", static_cast<unsigned long long>(h));
         const std::string name = "shader_" + std::string(hex) + std::string(suffix) + "_" + std::string(hash) + ".req";
-        static std::mutex variantMutex;
-        static std::set<std::string> variantDumped;
         std::lock_guard lock(variantMutex);
         if (!variantDumped.insert(name).second) return name;
+        if (dumpLimit > 0 && dumpCount >= static_cast<std::size_t>(dumpLimit)) {
+            if (!limitAnnounced) {
+                limitAnnounced = true;
+                char msg[128];
+                std::snprintf(msg, sizeof(msg), "[gpu] graphics request dumps stopped at %d files (APS5_DUMP_GRAPHICS_LIMIT)\n", dumpLimit);
+                std::fwrite(msg, 1, std::strlen(msg), stderr);
+            }
+            return {};
+        }
         if (std::FILE* file = std::fopen(name.c_str(), "wb")) {
-            std::fwrite(text.data(), 1, text.size(), file);
+            const size_t written = std::fwrite(text.data(), 1, text.size(), file);
             std::fclose(file);
+            if (written != text.size()) {
+                char hex2[32];
+                std::snprintf(hex2, sizeof(hex2), "%llx", static_cast<unsigned long long>(address));
+                char hash2[17];
+                std::snprintf(hash2, sizeof(hash2), "%016llx", static_cast<unsigned long long>(h));
+                const std::string failedName = "shader_" + std::string(hex2) + std::string(suffix) + "_" + std::string(hash2) + ".req";
+                char errBuf[256];
+                std::snprintf(errBuf, sizeof(errBuf), "%s", std::strerror(errno));
+                char msg[256];
+                std::snprintf(msg, sizeof(msg), "[gpu] could not write %s: %s\n", failedName.c_str(), errBuf);
+                std::fwrite(msg, 1, std::strlen(msg), stderr);
+                variantDumped.erase(failedName);
+                return {};
+            }
+            ++dumpCount;
+            return name;
+        } else {
+            char hex2[32];
+            std::snprintf(hex2, sizeof(hex2), "%llx", static_cast<unsigned long long>(address));
+            char hash2[17];
+            std::snprintf(hash2, sizeof(hash2), "%016llx", static_cast<unsigned long long>(h));
+            const std::string failedName = "shader_" + std::string(hex2) + std::string(suffix) + "_" + std::string(hash2) + ".req";
+            char errBuf[256];
+            std::snprintf(errBuf, sizeof(errBuf), "%s", std::strerror(errno));
+            char msg[256];
+            std::snprintf(msg, sizeof(msg), "[gpu] could not write %s: %s\n", failedName.c_str(), errBuf);
+            std::fwrite(msg, 1, std::strlen(msg), stderr);
+            return {};
         }
     } catch (const std::exception& error) {
-        char hex[32];
-        std::snprintf(hex, sizeof(hex), "%llx", static_cast<unsigned long long>(address));
-        std::fprintf(stderr, "[gpu] could not serialize request for 0x%llx: %s\n", static_cast<unsigned long long>(address), error.what());
+        std::lock_guard lock(variantMutex);
+        if (serializedErrors.insert(address).second) {
+            char hex[32];
+            std::snprintf(hex, sizeof(hex), "%llx", static_cast<unsigned long long>(address));
+            std::fprintf(stderr, "[gpu] could not serialize request for 0x%llx: %s\n", static_cast<unsigned long long>(address), error.what());
+        }
+        return {};
     }
-    return {};
 }
 
 }
