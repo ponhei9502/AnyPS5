@@ -3296,11 +3296,11 @@ if(BUILD_TESTING)
     target_link_libraries(agc_driver_frame_capture_eop_tests PRIVATE libSceAgcDriver libkernel libc libzstd_static)
     set_target_properties(agc_driver_frame_capture_eop_tests PROPERTIES CXX_EXTENSIONS OFF)
     configure_windows_unwind(agc_driver_frame_capture_eop_tests)
-    add_test(NAME agc_driver_frame_capture_eop COMMAND agc_driver_frame_capture_eop_tests)
-    set_tests_properties(agc_driver_frame_capture_eop PROPERTIES
-            ENVIRONMENT "ANYPS5_NO_SHADER_CACHE=1;APS5_FRAME_CAPTURE=${CMAKE_CURRENT_BINARY_DIR}/frame-capture-eop;APS5_FRAME_CAPTURE_AT_FLIP=1;APS5_FRAME_CAPTURE_FRAMES=3"
-            TIMEOUT 120)
     if(WIN32)
+        add_test(NAME agc_driver_frame_capture_eop COMMAND agc_driver_frame_capture_eop_tests)
+        set_tests_properties(agc_driver_frame_capture_eop PROPERTIES
+                ENVIRONMENT "ANYPS5_NO_SHADER_CACHE=1;APS5_FRAME_CAPTURE=${CMAKE_CURRENT_BINARY_DIR}/frame-capture-eop;APS5_FRAME_CAPTURE_AT_FLIP=1;APS5_FRAME_CAPTURE_FRAMES=3"
+                TIMEOUT 120)
         set_tests_properties(agc_driver_frame_capture_eop PROPERTIES ENVIRONMENT_MODIFICATION
                 "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
     endif()
@@ -3334,11 +3334,11 @@ if(BUILD_TESTING)
     set_target_properties(agc_driver_frame_replay_tests PROPERTIES CXX_EXTENSIONS OFF)
     configure_windows_unwind(agc_driver_frame_replay_tests)
     add_dependencies(agc_driver_frame_replay_tests agc_frame_replay)
-    add_test(NAME agc_driver_frame_replay COMMAND agc_driver_frame_replay_tests $<TARGET_FILE:agc_frame_replay>)
-    set_tests_properties(agc_driver_frame_replay PROPERTIES
-            ENVIRONMENT "ANYPS5_NO_SHADER_CACHE=1;APS5_FRAME_CAPTURE=${CMAKE_CURRENT_BINARY_DIR}/frame-replay-capture;APS5_FRAME_CAPTURE_AT_FLIP=1;APS5_FRAME_CAPTURE_FRAMES=2"
-            TIMEOUT 120)
     if(WIN32)
+        add_test(NAME agc_driver_frame_replay COMMAND agc_driver_frame_replay_tests $<TARGET_FILE:agc_frame_replay>)
+        set_tests_properties(agc_driver_frame_replay PROPERTIES
+                ENVIRONMENT "ANYPS5_NO_SHADER_CACHE=1;APS5_FRAME_CAPTURE=${CMAKE_CURRENT_BINARY_DIR}/frame-replay-capture;APS5_FRAME_CAPTURE_AT_FLIP=1;APS5_FRAME_CAPTURE_FRAMES=2"
+                TIMEOUT 120)
         set_tests_properties(agc_driver_frame_replay PROPERTIES ENVIRONMENT_MODIFICATION
                 "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
     endif()
