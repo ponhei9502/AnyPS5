@@ -19,11 +19,7 @@ std::uint64_t address(const void* pointer) {
 std::byte* allocate(std::size_t size, bool gpu = true) {
     auto* bytes = static_cast<std::byte*>(GuestArena::GuestArenaAllocate_nid_postfix(size, 65536));
     check(bytes != nullptr, "guest allocation failed");
-#ifdef _WIN32
-    GuestArena::GuestArenaCommit_nid_postfix(bytes, size, PAGE_READWRITE, size);
-#else
-    GuestArena::GuestArenaCommit_nid_postfix(bytes, size, 3, size);
-#endif
+    GuestArena::GuestArenaCommit_nid_postfix(bytes, size, 0x04, size);
     GuestAllocations::Mutation mutation;
     mutation.Add(bytes, size, true, true, gpu);
     return bytes;
