@@ -70,4 +70,29 @@ std::string Driver::dumpRequest(std::uint64_t address, const ShaderRecompiler::R
     return name;
 }
 
+std::string Driver::dumpRequestVariant(std::uint64_t address, const ShaderRecompiler::RecompileRequest& request, std::string_view suffix) {
+    try {
+        const auto text = ShaderRecompiler::RequestSerializer{}.Serialize(request);
+        const auto h = std::hash<std::string>{}(text);
+        char hex[32];
+        std::snprintf(hex, sizeof(hex), "%llx", static_cast<unsigned long long>(address));
+        char hash[17];
+        std::snprintf(hash, sizeof(hash), "%016llx", static_cast<unsigned long long>(h));
+        const std::string name = "shader_" + std::string(hex) + std::string(suffix) + "_" + std::string(hash) + ".req";
+        static std::mutex variantMutex;
+        static std::set<std::string> variantDumped;
+        std::lock_guard lock(variantMutex);
+        if (!variantDumped.insert(name).second) return name;
+        if (std::FILE* file = std::fopen(name.c_str(), "wb")) {
+            std::fwrite(text.data(), 1, text.size(), file);
+            std::fclose(file);
+        }
+    } catch (const std::exception& error) {
+        char hex[32];
+        std::snprintf(hex, sizeof(hex), "%llx", static_cast<unsigned long long>(address));
+        std::fprintf(stderr, "[gpu] could not serialize request for 0x%llx: %s\n", static_cast<unsigned long long>(address), error.what());
+    }
+    return {};
+}
+
 }
