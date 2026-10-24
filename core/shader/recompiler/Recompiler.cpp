@@ -10,6 +10,8 @@
 #include <chrono>
 #include <cstdlib>
 #include <cstdio>
+#include <unordered_set>
+#include <vector>
 #include "CacheKey.hpp"
 #include "CompiledVariant.hpp"
 #include "VertexInputSpecialization.hpp"
@@ -368,9 +370,21 @@ struct EmissionFailure {
     std::exception_ptr failure;
 };
 
-constexpr std::size_t ResultMemoSets = 64;
 constexpr std::size_t ResultMemoWays = 4;
-using ResultMemoTable = std::array<ResultMemoEntry, ResultMemoSets * ResultMemoWays>;
+std::size_t ResultMemoSets() {
+    static const std::size_t value = [] {
+        const char* env = std::getenv("APS5_RESULT_MEMO_SETS");
+        if (env == nullptr || *env == '\0' || std::strcmp(env, "0") == 0) return std::size_t{64};
+        char* end = nullptr;
+        const auto n = std::strtoul(env, &end, 10);
+        if (end == env) return std::size_t{64};
+        if (n < 1) return std::size_t{1};
+        if (n > 4096) return std::size_t{4096};
+        return static_cast<std::size_t>(n);
+    }();
+    return value;
+}
+using ResultMemoTable = std::vector<ResultMemoEntry>;
 
 struct SourceEntry : std::enable_shared_from_this<SourceEntry> {
     std::mutex mutex;
@@ -391,6 +405,7 @@ struct SourceEntry : std::enable_shared_from_this<SourceEntry> {
     std::vector<EmissionFailure> emissionFailures;
     std::unique_ptr<ResultMemoTable> memo;
     std::uint64_t memoClock = 0;
+    std::unordered_set<std::uint64_t> memoGhosts;
 };
 
 namespace {
@@ -1415,12 +1430,14 @@ bool ResultMemo() {
 
 ResultMemoEntry* memoSet(SourceEntry& source, std::uint64_t index) {
     if (source.memo == nullptr) return nullptr;
-    return source.memo->data() + static_cast<std::size_t>((index ^ (index >> 32u)) % ResultMemoSets) * ResultMemoWays;
+    return source.memo->data() + static_cast<std::size_t>((index ^ (index >> 32u)) % ResultMemoSets()) * ResultMemoWays;
 }
 
 struct ResultMemoCounters {
     std::atomic<std::uint64_t> hits{0}, misses{0}, evictions{0}, populateNanoseconds{0};
+    std::atomic<std::uint64_t> ghostHits{0}, liveEntries{0}, tables{0};
     std::atomic<std::int64_t> lastReport{0};
+    std::atomic<std::uint64_t> currentSpirvWords{0};
 };
 
 ResultMemoCounters& resultMemoCounters() {
@@ -1444,6 +1461,14 @@ void reportResultMemo() {
     const auto evictions = counters.evictions.exchange(0, std::memory_order_relaxed);
     const auto populate = counters.populateNanoseconds.exchange(0, std::memory_order_relaxed);
     std::fprintf(stderr, "[recompile] result memo (10 s): %llu hits, %llu misses (%.1f%% hits), Populate %.1f us per miss / %.1f ms in total, %llu evictions\n", static_cast<unsigned long long>(hits), static_cast<unsigned long long>(misses), hits + misses != 0 ? 100.0 * static_cast<double>(hits) / static_cast<double>(hits + misses) : 0.0, misses != 0 ? static_cast<double>(populate) / 1000.0 / static_cast<double>(misses) : 0.0, static_cast<double>(populate) / 1e6, static_cast<unsigned long long>(evictions));
+    static const bool ghost = std::getenv("APS5_RESULT_MEMO_GHOST") != nullptr;
+    if (!ghost) return;
+    const auto ghostReHits = counters.ghostHits.exchange(0, std::memory_order_relaxed);
+    const auto S = ResultMemoSets();
+    const auto tableCount = counters.tables.load(std::memory_order_relaxed);
+    const auto live = counters.liveEntries.load(std::memory_order_relaxed);
+    const auto spirvWords = counters.currentSpirvWords.load(std::memory_order_relaxed);
+    std::fprintf(stderr, "[recompile] result memo ghosts (10 s): ghost re-hits %llu of %llu misses (%.1f%%), sets %llu x ways 4, tables %llu, live entries %llu, table MiB %llu, result MiB %llu\n", static_cast<unsigned long long>(ghostReHits),  static_cast<unsigned long long>(misses), misses != 0 ? 100.0 * static_cast<double>(ghostReHits) / static_cast<double>(misses) : 0.0, static_cast<unsigned long long>(S), static_cast<unsigned long long>(tableCount), static_cast<unsigned long long>(live), static_cast<unsigned long long>(tableCount * S * 4 * sizeof(ResultMemoEntry) >> 20), static_cast<unsigned long long>(spirvWords * 4u >> 20));
 }
 
 // Everything materializeResult reads besides the variant: the snapshot (the descriptor words, the
@@ -1551,7 +1576,12 @@ std::shared_ptr<const RecompileResult> materializePreparedMemoized(SourceEntry& 
     std::shared_ptr<const RecompileResult> shared = std::move(result);
     {
         std::lock_guard lock(source.mutex);
-        if (source.memo == nullptr) source.memo = std::make_unique<ResultMemoTable>();
+        static const bool ghost = std::getenv("APS5_RESULT_MEMO_GHOST") != nullptr;
+        if (ghost && source.memoGhosts.erase(index) != 0) counters.ghostHits.fetch_add(1, std::memory_order_relaxed);
+        if (source.memo == nullptr) {
+            source.memo = std::make_unique<ResultMemoTable>(ResultMemoSets() * ResultMemoWays);
+            counters.tables.fetch_add(1, std::memory_order_relaxed);
+        }
         auto* set = memoSet(source, index);
         auto* victim = set;
         bool present = false;
@@ -1566,8 +1596,20 @@ std::shared_ptr<const RecompileResult> materializePreparedMemoized(SourceEntry& 
             }
         }
         if (!present) {
-            if (victim->result != nullptr) counters.evictions.fetch_add(1, std::memory_order_relaxed);
+            if (victim->result != nullptr) {
+                counters.evictions.fetch_add(1, std::memory_order_relaxed);
+                const auto victimIndex = (victim->variantId * 0x9e3779b97f4a7c15ull) ^ victim->hash;
+                static const bool ghost = std::getenv("APS5_RESULT_MEMO_GHOST") != nullptr;
+                if (ghost) {
+                    source.memoGhosts.insert(victimIndex);
+                    if (source.memoGhosts.size() > 4u * ResultMemoSets() * ResultMemoWays) source.memoGhosts.clear();
+                }
+                counters.currentSpirvWords.fetch_sub(victim->result->spirv.Words().size(), std::memory_order_relaxed);
+            } else {
+                counters.liveEntries.fetch_add(1, std::memory_order_relaxed);
+            }
             *victim = {variant->artifact.variantId, hash, shared, ++source.memoClock};
+            counters.currentSpirvWords.fetch_add(shared->spirv.Words().size(), std::memory_order_relaxed);
         }
     }
     reportResultMemo();
