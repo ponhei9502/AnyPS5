@@ -1,8 +1,50 @@
 #include "prx/libSceAgcDriver/Execution/include/ProfileOutput.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
 #include "Optimization/ResourceProgram.hpp"
+#include <cstdlib>
+#include <mutex>
+#include <unordered_map>
 
 namespace AgcDriver::DriverDetail {
+
+namespace {
+
+struct DispatchShapes {
+    std::mutex mutex;
+    std::unordered_map<std::uint64_t, std::uint64_t> lastKey;
+    std::uint64_t lookups = 0;
+    std::uint64_t sameKey = 0;
+    std::uint64_t newKeyKnownShape = 0;
+    std::uint64_t newShape = 0;
+};
+
+DispatchShapes& Shapes() {
+    static DispatchShapes shapes;
+    return shapes;
+}
+
+}
+
+void Driver::noteDispatchShape(std::uint64_t shape, std::uint64_t key) {
+    auto& shapes = Shapes();
+    std::lock_guard lock(shapes.mutex);
+    ++shapes.lookups;
+    if (shapes.lastKey.size() >= 65536 && !shapes.lastKey.contains(shape)) shapes.lastKey.clear();
+    const auto [it, inserted] = shapes.lastKey.try_emplace(shape, key);
+    if (inserted) ++shapes.newShape;
+    else if (it->second == key) ++shapes.sameKey;
+    else ++shapes.newKeyKnownShape;
+    it->second = key;
+}
+
+void Driver::reportDispatchShapes() {
+    static const bool shapeStats = std::getenv("APS5_DISPATCH_SHAPE_STATS") != nullptr;
+    if (!shapeStats) return;
+    auto& shapes = Shapes();
+    std::lock_guard lock(shapes.mutex);
+    AgcDriver::ProfilePrint_nid_no_patch("[dispatch-shape] (10 s): lookups %llu, same key as the shape's last %llu, new key for a known shape %llu, new shape %llu (%zu shapes kept)\n", static_cast<unsigned long long>(shapes.lookups), static_cast<unsigned long long>(shapes.sameKey), static_cast<unsigned long long>(shapes.newKeyKnownShape), static_cast<unsigned long long>(shapes.newShape), shapes.lastKey.size());
+    shapes.lookups = shapes.sameKey = shapes.newKeyKnownShape = shapes.newShape = 0;
+}
 
 void Driver::classifyDiffering(std::uint64_t program, std::uint64_t key, const DispatchVariant& old, const DispatchVariant& fresh, const ShaderRecompiler::ResourceCapture* capture, EntryCounters& counters) {
     ++counters.differingClassified;
@@ -82,6 +124,7 @@ void Driver::reportDispatchCache(EntryCounters& counters) {
         dataRanks += text;
     }
     AgcDriver::ProfilePrint_nid_no_patch("[dispatch-cache] data hits (10 s): %llu (%llu words refreshed; by rank 1..k %s; %llu data variants missed on pending runs), verified %llu; inserts with data positions %llu of %llu (%.1f positions each), leaves skipped: unmapped %llu, mismatched %llu, aliased %llu\n", count(counters.dataHits), count(counters.dataWordsRefreshed), dataRanks.c_str(), count(dataPendingMisses.exchange(0, std::memory_order_relaxed)), count(counters.dataVerified), count(counters.dataInserts), count(counters.inserts), counters.dataInserts != 0 ? static_cast<double>(counters.dataPositionsInserted) / static_cast<double>(counters.dataInserts) : 0.0, count(counters.dataLeavesUnmapped), count(counters.dataLeavesMismatched), count(counters.dataLeavesAliased));
+    reportDispatchShapes();
     counters = EntryCounters{};
 }
 

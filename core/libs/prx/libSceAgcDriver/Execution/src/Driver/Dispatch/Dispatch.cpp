@@ -226,6 +226,30 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
             mix(value);
         }
     }
+    // B64a (10-24, measure only): how many keys differ from their shape's last key only in the user-data words.
+    static const bool shapeStats = std::getenv("APS5_DISPATCH_SHAPE_STATS") != nullptr;
+    if (shapeStats) {
+        std::uint64_t shapeKey = 0xcbf29ce484222325ull;
+        const auto shapeMix = [&](std::uint64_t value) {
+            shapeKey ^= value;
+            shapeKey *= 0x100000001b3ull;
+        };
+        shapeMix(address);
+        shapeMix(packet[4] & 0x8000u);
+        for (const auto threads : compute.partialThreads) shapeMix(threads);
+        if (keyHygiene) {
+            for (const auto offset : {0x207u, 0x208u, 0x209u, 0x212u, 0x213u}) {
+                const auto found = queue.shader.find(offset);
+                shapeMix(found == queue.shader.end() ? (1ull << 32u) : found->second);
+            }
+        } else {
+            for (const auto& [offset, value] : queue.shader) {
+                shapeMix(offset);
+                shapeMix(value);
+            }
+        }
+        noteDispatchShape(shapeKey, key);
+    }
     std::shared_ptr<const ShaderRecompiler::RecompileResult> compiledResult;
 
     std::shared_ptr<DispatchVariant> keepVariant;
