@@ -22,6 +22,7 @@
 #ifdef _WIN32
 #include <windows.h>
 #else
+#include <sys/mman.h>
 #include <unistd.h>
 #endif
 
@@ -580,7 +581,74 @@ std::vector<FrameRecorder::Range> FrameRecorder::committedRanges() {
     }
     return result;
 #else
-    throw std::runtime_error("frame capture: guest memory capture is implemented on Windows only");
+    // Linux: the same ranges from /proc/self/maps. An unmapped gap is not committed. Guest direct memory is a shared memfd mapping
+    // (Section, as a Windows section view); other shared mappings are Section, file-backed ones File; private anonymous memory is
+    // Watched or Unwatched as on Windows. protection holds PROT_* bits.
+    std::uintptr_t base = 0;
+    std::size_t size = 0;
+    GuestArena::GuestArenaRange_nid_postfix(&base, &size);
+    if (size == 0) throw std::runtime_error("frame capture: the guest arena is not reserved");
+    struct Mapping {
+        std::uint64_t start = 0;
+        std::uint64_t end = 0;
+        std::uint32_t protection = 0;
+        bool readable = false;
+        bool shared = false;
+        bool memfd = false;
+        bool file = false;
+    };
+    std::vector<Mapping> mappings;
+    {
+        std::ifstream maps("/proc/self/maps");
+        if (!maps) throw std::runtime_error("frame capture: cannot read /proc/self/maps");
+        std::string line;
+        while (std::getline(maps, line)) {
+            unsigned long long start = 0, end = 0;
+            char perms[5] = {};
+            int pathAt = 0;
+            if (std::sscanf(line.c_str(), "%llx-%llx %4s %*s %*s %*s %n", &start, &end, perms, &pathAt) < 3) continue;
+            const std::string_view path = pathAt > 0 && static_cast<std::size_t>(pathAt) <= line.size() ? std::string_view(line).substr(static_cast<std::size_t>(pathAt)) : std::string_view();
+            Mapping mapping;
+            mapping.start = start;
+            mapping.end = end;
+            mapping.readable = perms[0] == 'r';
+            mapping.protection = (perms[0] == 'r' ? PROT_READ : 0) | (perms[1] == 'w' ? PROT_WRITE : 0) | (perms[2] == 'x' ? PROT_EXEC : 0);
+            mapping.shared = perms[3] == 's';
+            mapping.memfd = path.starts_with("/memfd:");
+            mapping.file = !mapping.memfd && path.starts_with("/");
+            mappings.push_back(mapping);
+        }
+    }
+    std::sort(mappings.begin(), mappings.end(), [](const Mapping& a, const Mapping& b) { return a.start < b.start; });
+    std::vector<Range> result;
+    for (const auto& allocation : GuestAllocations::GuestAllocationsAcquireAll_nid_postfix()) {
+        if (!allocation->readable) continue;
+        const auto first = allocation->address;
+        const auto end = first + allocation->bytes;
+        const bool host = first < base || end > base + size;
+        const auto access = FrameRangeAccess::Readable | (allocation->writable ? FrameRangeAccess::Writable : 0u) | (allocation->gpu ? FrameRangeAccess::Gpu : 0u);
+        // the first mapping that ends after `first`
+        auto it = std::upper_bound(mappings.begin(), mappings.end(), first, [](std::uint64_t address, const Mapping& mapping) { return address < mapping.end; });
+        for (; it != mappings.end() && it->start < end; ++it) {
+            const auto pieceStart = std::max<std::uint64_t>(first, it->start);
+            const auto pieceEnd = std::min<std::uint64_t>(end, it->end);
+            if (pieceStart >= pieceEnd) continue;
+            Range range;
+            range.address = pieceStart;
+            range.bytes = pieceEnd - pieceStart;
+            range.protection = it->protection;
+            range.access = access;
+            range.readable = it->readable;
+            if (host) range.kind = FrameRangeKind::Host;
+            else if (it->memfd || it->shared) range.kind = FrameRangeKind::Section;
+            else if (it->file) range.kind = FrameRangeKind::File;
+            else range.kind = GuestMemory::Watched(range.address, static_cast<std::size_t>(range.bytes)) ? FrameRangeKind::Watched : FrameRangeKind::Unwatched;
+            auto& last = result.empty() ? range : result.back();
+            if (!result.empty() && last.address + last.bytes == range.address && last.kind == range.kind && last.protection == range.protection && last.readable == range.readable && last.access == range.access) last.bytes += range.bytes;
+            else result.push_back(range);
+        }
+    }
+    return result;
 #endif
 }
 
