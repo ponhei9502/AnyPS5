@@ -1163,6 +1163,40 @@ std::size_t drawKindIndex(std::uint32_t opcode) {
     }
 }
 
+// B97 probe (10-24): why draws begin a render pass instead of continuing the previous one. Per 10 s under APS5_PROFILE_DRAW:
+// "[draw-passes] (10 s): continued N, begun N; forced: capture N, reads target N, GPU indirect with argument rewrite N,
+// GPU indirect without rewrite N, mesh indirect N, LDS subgroup N; begun unforced N".
+enum PassCount : std::size_t { PassContinued, PassBegun, ForcedCapture, ForcedReadsTarget, ForcedIndirectRewrite, ForcedIndirectPlain, ForcedMeshIndirect, ForcedLds, BegunUnforced, PassCounts };
+std::array<std::atomic<std::uint64_t>, PassCounts> passCounts{};
+std::atomic<std::int64_t> passesReportedAt{0};
+
+void countPassStart(bool continued, bool capture, bool readsTarget, bool gpuIndirect, bool rewrite, bool meshIndirect, bool lds) {
+    static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
+    if (!profile) return;
+    passCounts[continued ? PassContinued : PassBegun].fetch_add(1, std::memory_order_relaxed);
+    if (!continued) {
+        bool forced = false;
+        const auto add = [&](bool reason, PassCount what) { if (reason) { passCounts[what].fetch_add(1, std::memory_order_relaxed); forced = true; } };
+        add(capture, ForcedCapture);
+        add(readsTarget, ForcedReadsTarget);
+        add(gpuIndirect && rewrite, ForcedIndirectRewrite);
+        add(gpuIndirect && !rewrite, ForcedIndirectPlain);
+        add(meshIndirect, ForcedMeshIndirect);
+        add(lds, ForcedLds);
+        if (!forced) passCounts[BegunUnforced].fetch_add(1, std::memory_order_relaxed);
+    }
+    const auto now = std::chrono::duration_cast<std::chrono::seconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+    auto last = passesReportedAt.load(std::memory_order_relaxed);
+    if (last == 0) { passesReportedAt.compare_exchange_strong(last, now, std::memory_order_relaxed); return; }
+    if (now - last < 10 || !passesReportedAt.compare_exchange_strong(last, now, std::memory_order_relaxed)) return;
+    std::array<std::uint64_t, PassCounts> c{};
+    for (std::size_t i = 0; i < PassCounts; ++i) c[i] = passCounts[i].exchange(0, std::memory_order_relaxed);
+    std::fprintf(stderr, "[draw-passes] (10 s): continued %llu, begun %llu; forced: capture %llu, reads target %llu, GPU indirect with argument rewrite %llu, GPU indirect without rewrite %llu, mesh indirect %llu, LDS subgroup %llu; begun unforced %llu\n",
+                 static_cast<unsigned long long>(c[PassContinued]), static_cast<unsigned long long>(c[PassBegun]), static_cast<unsigned long long>(c[ForcedCapture]),
+                 static_cast<unsigned long long>(c[ForcedReadsTarget]), static_cast<unsigned long long>(c[ForcedIndirectRewrite]), static_cast<unsigned long long>(c[ForcedIndirectPlain]),
+                 static_cast<unsigned long long>(c[ForcedMeshIndirect]), static_cast<unsigned long long>(c[ForcedLds]), static_cast<unsigned long long>(c[BegunUnforced]));
+}
+
 void countDrawKind(const std::array<double, PhaseCount>& us) {
     const auto kind = drawKindIndex(drawKindOpcode);
     drawKindCounts[kind].fetch_add(1, std::memory_order_relaxed);
@@ -2308,6 +2342,7 @@ void recordDraw(const Context& context, const State& state, const Pm4::DrawParam
     const auto start = recorder->StartDrawPass(passKey, capture || readsTarget || gpuIndirect || meshIndirect || PixelFunctionLdsSubgroup(shaders) != 0u, fenced, passAccess);
     for (const auto& target : record.multisampleTargets) KeepMultisampleTarget_nid_no_patch(target);
     const bool continued = start.continued;
+    countPassStart(continued, capture, readsTarget, gpuIndirect, gpuIndirect && (args->vertexRule == Pm4::DrawParameters::IndirectDraw::Rule::Constant || args->instanceRule == Pm4::DrawParameters::IndirectDraw::Rule::Constant), meshIndirect, PixelFunctionLdsSubgroup(shaders) != 0u);
     outcome.passContinued = continued;
     outcome.passBegun = !continued;
     const auto commands = start.commands;
