@@ -281,7 +281,8 @@ bool FrameRecorder::triggered() {
 void FrameRecorder::emitDelta() {
     std::vector<Span> spans;
     for (const auto& range : ranges) {
-        if (range.kind == FrameRangeKind::Watched || range.kind == FrameRangeKind::Unwatched) spans.push_back({range.address, range.bytes, generation});
+        // Section (memfd direct memory) is write-watched on Linux; B71d.
+        if (range.kind == FrameRangeKind::Watched || range.kind == FrameRangeKind::Unwatched || range.kind == FrameRangeKind::Section) spans.push_back({range.address, range.bytes, generation});
     }
     const auto mark = GuestMemory::WriteGeneration();
     const auto added = newRanges();
@@ -468,7 +469,8 @@ void FrameRecorder::start() {
     writer = std::make_unique<FrameCaptureWriter>(directory);
     std::vector<std::pair<std::uint64_t, std::uint64_t>> written;
     for (const auto& range : ranges) {
-        if (range.kind == FrameRangeKind::Watched || range.kind == FrameRangeKind::Unwatched) GuestMemory::CollectWrittenBlocks(range.address, static_cast<std::size_t>(range.bytes), std::numeric_limits<std::uint64_t>::max(), written);
+        // Section (memfd direct memory) is write-watched on Linux; B71d.
+        if (range.kind == FrameRangeKind::Watched || range.kind == FrameRangeKind::Unwatched || range.kind == FrameRangeKind::Section) GuestMemory::CollectWrittenBlocks(range.address, static_cast<std::size_t>(range.bytes), std::numeric_limits<std::uint64_t>::max(), written);
     }
     generation = GuestMemory::WriteGeneration();
     for (const auto& range : ranges) {
