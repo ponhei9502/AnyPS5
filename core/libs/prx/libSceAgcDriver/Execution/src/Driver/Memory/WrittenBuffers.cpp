@@ -167,6 +167,12 @@ std::vector<std::pair<std::uint64_t, std::uint64_t>> QueuedDrawReadRanges(const 
         ranges.emplace_back(begin, begin + bytes);
     };
     if (draw.indexed && draw.indexSize != 0 && draw.indexCount != 0) add(draw.indexAddress, static_cast<std::uint64_t>(draw.indexCount) * draw.indexSize);
+    // A queued GPU-path indirect draw (APS5_PIPELINED_GPU_INDIRECT) reads its records, and its count dword, on the GPU at
+    // execution: a write still queued on the pipeline over them must land first.
+    if (draw.indirect) {
+        add(draw.indirect->arguments, draw.indirect->RangeBytes());
+        if (draw.indirect->countIndirect) add(draw.indirect->countAddress, sizeof(std::uint32_t));
+    }
     if (stages.empty()) return ranges;
     for (const auto& stage : stages) {
         if (stage.program == nullptr) continue;

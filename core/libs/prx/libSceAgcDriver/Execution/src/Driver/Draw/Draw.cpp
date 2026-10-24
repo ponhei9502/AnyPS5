@@ -625,6 +625,8 @@ DrawVerdict Driver::finishDraw(DrawTail& tail, PerformanceTimer& timing) {
     auto& drawParameters = tail.drawParameters;
     const bool pipelined = tail.pipelined;
     static const bool pipelinedIndirect = std::getenv("APS5_NO_PIPELINED_INDIRECT") == nullptr;
+    // B96 (10-24): GPU-path indirect draws on the draw pipeline instead of draining it and drawing inline (default off).
+    static const bool pipelinedGpuIndirect = std::getenv("APS5_PIPELINED_GPU_INDIRECT") != nullptr;
     const auto drainBeforeInline = [&] {
         if (pipelined && DrawPipeline::Queue0().Busy()) DrawPipeline::Queue0().Drain(DrawPipeline::DrainReason::Indirect);
     };
@@ -1138,7 +1140,11 @@ DrawVerdict Driver::finishDraw(DrawTail& tail, PerformanceTimer& timing) {
             return DrawVerdict::Rejected;
         }
     }
-    if (pipelined && !drawParameters.indirect && (tail.queue == nullptr || deferredLabels().labels.empty())) {
+    // An indirect draw reaching here takes the GPU path (the CPU path returned above), so the GPU reads its records:
+    // with APS5_PIPELINED_GPU_INDIRECT it is queued like a direct draw (its records are in the read ranges), unless
+    // this thread holds the GPU lock, which commitDraw takes itself.
+    const bool queueIndirect = drawParameters.indirect && pipelinedGpuIndirect && !gpuLock.owns_lock();
+    if (pipelined && (!drawParameters.indirect || queueIndirect) && (tail.queue == nullptr || deferredLabels().labels.empty())) {
         phaseTiming.Phase(DrawRowVectors);
         auto writes = drawWriteRanges(graphics, stages);
         const auto commitQueue = submission.queue;
