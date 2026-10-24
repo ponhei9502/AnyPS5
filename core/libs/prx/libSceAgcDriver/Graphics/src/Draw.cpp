@@ -2303,6 +2303,19 @@ void recordDraw(const Context& context, const State& state, const Pm4::DrawParam
         if (args->countIndirect) passReads.emplace_back(args->countAddress, args->countAddress + 4);
     }
     passReads.insert(passReads.end(), inputs.inPlaceReads.begin(), inputs.inPlaceReads.end());
+    // B97 (10-24): APS5_PASS_FORCE_ONLY_REWRITE=1 forces a new pass for a GPU-path indirect draw only when its records are
+    // rewritten (recordIndirectArguments: a copy and updates, illegal inside a pass). Otherwise the records join the pass's
+    // reads, so a write to them recorded earlier in the batch still breaks the pass through the hazard check.
+    static const bool forceOnlyRewrite = std::getenv("APS5_PASS_FORCE_ONLY_REWRITE") != nullptr;
+    const bool argumentsRewritten = gpuIndirect && (args->vertexRule == Pm4::DrawParameters::IndirectDraw::Rule::Constant || args->instanceRule == Pm4::DrawParameters::IndirectDraw::Rule::Constant);
+    // A continued pass is safe only when it began with an indirect draw's argument barrier (recordIndirectArguments:
+    // ALL_COMMANDS -> DRAW_INDIRECT): the pass-start barrier does not cover indirect-command reads. Per recording thread.
+    thread_local bool passHasIndirectBarrier = false;
+    const bool forcedByIndirect = gpuIndirect && (!forceOnlyRewrite || argumentsRewritten || !passHasIndirectBarrier);
+    if (gpuIndirect && !forcedByIndirect) {
+        passReads.emplace_back(args->arguments, args->arguments + args->RangeBytes());
+        if (args->countIndirect) passReads.emplace_back(args->countAddress, args->countAddress + 4);
+    }
     const auto passImages = resources.StorageImages();
     std::vector<std::pair<VkImage, bool>> passAttachments;
     passAttachments.reserve(record.targets.size());
@@ -2339,10 +2352,10 @@ void recordDraw(const Context& context, const State& state, const Pm4::DrawParam
     }
     const PassAccess passAccess{passReads, passWrites, passImages, passAttachments, unknownMemory, unknownWrites, passWriteOnly};
     const bool fenced = state.depth.has_value() || !record.proxies.empty();
-    const auto start = recorder->StartDrawPass(passKey, capture || readsTarget || gpuIndirect || meshIndirect || PixelFunctionLdsSubgroup(shaders) != 0u, fenced, passAccess);
+    const auto start = recorder->StartDrawPass(passKey, capture || readsTarget || forcedByIndirect || meshIndirect || PixelFunctionLdsSubgroup(shaders) != 0u, fenced, passAccess);
     for (const auto& target : record.multisampleTargets) KeepMultisampleTarget_nid_no_patch(target);
     const bool continued = start.continued;
-    countPassStart(continued, capture, readsTarget, gpuIndirect, gpuIndirect && (args->vertexRule == Pm4::DrawParameters::IndirectDraw::Rule::Constant || args->instanceRule == Pm4::DrawParameters::IndirectDraw::Rule::Constant), meshIndirect, PixelFunctionLdsSubgroup(shaders) != 0u);
+    countPassStart(continued, capture, readsTarget, forcedByIndirect, argumentsRewritten, meshIndirect, PixelFunctionLdsSubgroup(shaders) != 0u);
     outcome.passContinued = continued;
     outcome.passBegun = !continued;
     const auto commands = start.commands;
@@ -2371,8 +2384,16 @@ void recordDraw(const Context& context, const State& state, const Pm4::DrawParam
     bool rewritten = false;
     if (!meshIndirect && !inputs.restartTable.empty()) meshArguments = directMeshArguments(context, draw, inputs.restartTable);
     if (continued) {
+        if (gpuIndirect) {
+            // Not rewritten (else the pass was forced): the draw reads its records in place; no commands inside the pass.
+            recorder->NotePendingRead(args->arguments, static_cast<std::size_t>(args->RangeBytes()), Recorder::ReadKind::Indirect);
+            if (args->countIndirect) recorder->NotePendingRead(args->countAddress, 4, Recorder::ReadKind::Indirect);
+            argumentBuffer = record.indirect->argumentImport->buffer;
+            argumentOffset = HostImportOffset(*record.indirect->argumentImport, args->arguments);
+        }
         record.pipeline->Continue(commands, state);
     } else {
+        passHasIndirectBarrier = gpuIndirect;
         for (const auto& proxy : record.proxies) {
             proxy->RecordAttachmentProxyLoad(commands, VK_IMAGE_LAYOUT_GENERAL);
             countBarrier(2);
