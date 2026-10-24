@@ -224,6 +224,9 @@ std::list<CachedTexture>::iterator findTexture(TextureCache& cache, const Textur
     return cache.entries.end();
 }
 
+std::uint64_t SnapshotPoolBytes();
+void parkSnapshot(TextureCache& cache, std::vector<std::byte>& bytes);
+
 void eraseTexture(TextureCache& cache, std::list<CachedTexture>::iterator it) {
     cache.bytes -= it->accounted;
     if (it->source != nullptr) {
@@ -235,6 +238,7 @@ void eraseTexture(TextureCache& cache, std::list<CachedTexture>::iterator it) {
         }
     }
     if (it->texture.use_count() > 1) noteReleased(it->texture);
+    if (SnapshotPoolBytes() != 0 && !it->bytes.empty()) parkSnapshot(cache, it->bytes);
     cache.index.erase(it->key);
     cache.entries.erase(it);
     ++cache.erasures;
@@ -264,7 +268,100 @@ void touchTexture(TextureCache& cache, std::list<CachedTexture>::iterator it) {
 
 constexpr std::uint64_t SpareSnapshotBytes = 256ull << 20;
 
+// B66 part a (10-24, APS5_TEXTURE_SNAPSHOT_POOL_MIB=<n>, default 0 = the exact-size pool above): spare snapshot vectors of at
+// least 64 KiB filed by capacity, at most n MiB, the largest dropped first; a snapshot takes the smallest spare whose capacity
+// is >= its size and <= twice it. Evicted entries and refused one-use snapshots return their bytes too.
+// APS5_TEXTURE_CACHE_REPORT=1: "[texture-pool] (10 s): taken N, allocated N, returned N, dropped N, held MiB X".
+constexpr std::size_t SnapshotPoolMinBytes = 64u << 10u;
+
+std::uint64_t SnapshotPoolBytes() {
+    static const std::uint64_t bytes = [] {
+        const char* value = std::getenv("APS5_TEXTURE_SNAPSHOT_POOL_MIB");
+        return value != nullptr ? static_cast<std::uint64_t>(std::strtoull(value, nullptr, 10)) << 20u : std::uint64_t{0};
+    }();
+    return bytes;
+}
+
+struct SnapshotPoolCounts {
+    std::uint64_t taken = 0;
+    std::uint64_t allocated = 0;
+    std::uint64_t returned = 0;
+    std::uint64_t dropped = 0;
+    std::chrono::steady_clock::time_point reported = std::chrono::steady_clock::now();
+};
+
+// Called with the cache mutex held, like the pool itself.
+SnapshotPoolCounts& PoolCounts() {
+    static SnapshotPoolCounts counts;
+    return counts;
+}
+
+void reportSnapshotPool(const TextureCache& cache) {
+    static const bool report = std::getenv("APS5_TEXTURE_CACHE_REPORT") != nullptr;
+    if (!report) return;
+    auto& counts = PoolCounts();
+    const auto now = std::chrono::steady_clock::now();
+    if (now - counts.reported < std::chrono::seconds(10)) return;
+    AgcDriver::ProfilePrint_nid_no_patch("[texture-pool] (10 s): taken %llu, allocated %llu, returned %llu, dropped %llu, held MiB %llu (%zu spares, cap %llu MiB)\n", static_cast<unsigned long long>(counts.taken), static_cast<unsigned long long>(counts.allocated), static_cast<unsigned long long>(counts.returned), static_cast<unsigned long long>(counts.dropped), static_cast<unsigned long long>(cache.spareBytes >> 20u), cache.spare.size(), static_cast<unsigned long long>(SnapshotPoolBytes() >> 20u));
+    counts = SnapshotPoolCounts{};
+    counts.reported = now;
+}
+
+void expirePooled(TextureCache& cache, std::uint64_t present) {
+    while (!cache.spare.empty() && present - cache.spare.front().second > SpareSnapshotPresents) {
+        cache.spareBytes -= cache.spare.front().first.capacity();
+        cache.spare.erase(cache.spare.begin());
+        ++PoolCounts().dropped;
+    }
+}
+
+void parkPooled(TextureCache& cache, std::vector<std::byte>& bytes, std::uint64_t limit) {
+    const auto capacity = bytes.capacity();
+    if (capacity < SnapshotPoolMinBytes || capacity > limit) {
+        if (capacity >= SnapshotPoolMinBytes) ++PoolCounts().dropped;
+        bytes = std::vector<std::byte>{};
+        return;
+    }
+    expirePooled(cache, Recorder::Presents());
+    while (!cache.spare.empty() && cache.spareBytes + capacity > limit) {
+        const auto largest = std::max_element(cache.spare.begin(), cache.spare.end(), [](const auto& a, const auto& b) { return a.first.capacity() < b.first.capacity(); });
+        cache.spareBytes -= largest->first.capacity();
+        cache.spare.erase(largest);
+        ++PoolCounts().dropped;
+    }
+    cache.spareBytes += capacity;
+    cache.spare.emplace_back(std::move(bytes), Recorder::Presents());
+    ++PoolCounts().returned;
+    bytes = std::vector<std::byte>{};
+    reportSnapshotPool(cache);
+}
+
+std::vector<std::byte> takePooled(TextureCache& cache, std::size_t bytes) {
+    expirePooled(cache, Recorder::Presents());
+    auto best = cache.spare.end();
+    for (auto spare = cache.spare.begin(); spare != cache.spare.end(); ++spare) {
+        const auto capacity = spare->first.capacity();
+        if (capacity >= bytes && capacity / 2u <= bytes && (best == cache.spare.end() || capacity < best->first.capacity())) best = spare;
+    }
+    if (best == cache.spare.end()) {
+        if (bytes >= SnapshotPoolMinBytes) ++PoolCounts().allocated;
+        reportSnapshotPool(cache);
+        return {};
+    }
+    cache.spareBytes -= best->first.capacity();
+    std::vector<std::byte> taken = std::move(best->first);
+    cache.spare.erase(best);
+    taken.resize(bytes);
+    ++PoolCounts().taken;
+    reportSnapshotPool(cache);
+    return taken;
+}
+
 void parkSnapshot(TextureCache& cache, std::vector<std::byte>& bytes) {
+    if (const auto limit = SnapshotPoolBytes(); limit != 0) {
+        parkPooled(cache, bytes, limit);
+        return;
+    }
     const auto size = bytes.size();
     if (size == 0) return;
     const auto present = Recorder::Presents();
@@ -280,6 +377,7 @@ void parkSnapshot(TextureCache& cache, std::vector<std::byte>& bytes) {
 }
 
 std::vector<std::byte> spareSnapshot(TextureCache& cache, std::size_t bytes) {
+    if (SnapshotPoolBytes() != 0) return takePooled(cache, bytes);
     const auto present = Recorder::Presents();
     while (!cache.spare.empty() && present - cache.spare.front().second > SpareSnapshotPresents) {
         cache.spareBytes -= cache.spare.front().first.size();
@@ -332,6 +430,9 @@ bool admitTexture(TextureCache& cache, const TextureKey& key, std::uint64_t inco
     return true;
 }
 
+// B66c probe (10-24): live ShaderResources objects (the record caches keep them, and they hold shared_ptr<Texture>).
+std::atomic<std::int64_t> liveResourceSets{0};
+
 void reportCacheCounts(TextureCache& cache, std::uint64_t budget) {
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
     if (!profile) return;
@@ -339,7 +440,15 @@ void reportCacheCounts(TextureCache& cache, std::uint64_t budget) {
     if (now - cache.countsReported < std::chrono::seconds(10)) return;
     cache.countsReported = now;
     const auto counts = std::exchange(cache.counts, {});
-    AgcDriver::ProfilePrint_nid_no_patch("[texture-cache] (10 s): %llu textures cached, %llu used uncached (first use this frame with the least recently used entry used this frame or the last, or a later use with it used this frame), %llu evicted, %llu held ones passed over, %llu found changed; %llu MiB in %zu entries, budget %llu MiB, frame %llu\n", static_cast<unsigned long long>(counts.inserted), static_cast<unsigned long long>(counts.uncached), static_cast<unsigned long long>(counts.evicted), static_cast<unsigned long long>(counts.passed), static_cast<unsigned long long>(counts.stale), static_cast<unsigned long long>(cache.bytes >> 20u), cache.entries.size(), static_cast<unsigned long long>(budget >> 20u), static_cast<unsigned long long>(Recorder::Presents()));
+    // B66c: entries something outside the cache still holds (the ones admitTexture passes over instead of evicting).
+    std::uint64_t heldEntries = 0;
+    std::uint64_t heldBytes = 0;
+    for (const auto& entry : cache.entries) {
+        if (entry.texture.use_count() <= 1) continue;
+        ++heldEntries;
+        heldBytes += entry.accounted;
+    }
+    AgcDriver::ProfilePrint_nid_no_patch("[texture-cache] (10 s): %llu textures cached, %llu used uncached (first use this frame with the least recently used entry used this frame or the last, or a later use with it used this frame), %llu evicted, %llu held ones passed over, %llu found changed; %llu MiB in %zu entries, budget %llu MiB, frame %llu; held %llu entries, held MiB %llu; live resource sets %lld\n", static_cast<unsigned long long>(counts.inserted), static_cast<unsigned long long>(counts.uncached), static_cast<unsigned long long>(counts.evicted), static_cast<unsigned long long>(counts.passed), static_cast<unsigned long long>(counts.stale), static_cast<unsigned long long>(cache.bytes >> 20u), cache.entries.size(), static_cast<unsigned long long>(budget >> 20u), static_cast<unsigned long long>(Recorder::Presents()), static_cast<unsigned long long>(heldEntries), static_cast<unsigned long long>(heldBytes >> 20u), static_cast<long long>(liveResourceSets.load(std::memory_order_relaxed)));
 }
 
 struct ImageMemoEntry {
@@ -1008,6 +1117,7 @@ std::shared_ptr<Texture> cachedTexture(const Context& context, std::span<const s
     auto texture = entry.texture;
     if (!admitTexture(cache, key, entry.accounted, budget)) {
         noteReleased(texture);
+        if (SnapshotPoolBytes() != 0 && !entry.bytes.empty()) parkSnapshot(cache, entry.bytes);
         logLookup({texture.get(), resource, guestBytes, *keys, generation, source.get()});
         reportCacheCounts(cache, budget);
         reportTextureCounters();
@@ -5499,6 +5609,14 @@ std::vector<PresyncSurface> ShaderResources::PresyncSurfaces() const {
         }
     }
     return surfaces;
+}
+
+ShaderResources::LiveResourceSet::LiveResourceSet() {
+    liveResourceSets.fetch_add(1, std::memory_order_relaxed);
+}
+
+ShaderResources::LiveResourceSet::~LiveResourceSet() {
+    liveResourceSets.fetch_sub(1, std::memory_order_relaxed);
 }
 
 ShaderResources::~ShaderResources() {

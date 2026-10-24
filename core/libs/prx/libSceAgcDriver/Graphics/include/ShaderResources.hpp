@@ -610,6 +610,15 @@ private:
     std::vector<std::pair<std::uint64_t, std::uint64_t>> writeOnlyRanges;
     bool drawBuild = false;
     std::uint64_t dispatchThreads = 0;
+    // B66c probe (10-24): counts the live ShaderResources objects for the [texture-cache] line (a member, so a constructor that
+    // throws after it is built still uncounts it).
+    struct LiveResourceSet {
+        LiveResourceSet();
+        ~LiveResourceSet();
+        LiveResourceSet(const LiveResourceSet&) = delete;
+        LiveResourceSet& operator=(const LiveResourceSet&) = delete;
+    };
+    LiveResourceSet liveResourceSet;
     std::vector<std::shared_ptr<Texture>> textures;
     std::vector<bool> textureFirstLayer;
     std::vector<bool> textureBaseLevel;

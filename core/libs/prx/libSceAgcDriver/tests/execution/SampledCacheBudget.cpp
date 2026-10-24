@@ -693,10 +693,17 @@ void recycleTests(const Context& context) {
     constexpr std::size_t BigBytes = std::size_t{BigSide} * BigSide * 4u;
     const WatchedSurface watchedFirst(context, BigBytes);
     const WatchedSurface watchedSecond(context, BigBytes);
+    // B66 part a: APS5_TEXTURE_SNAPSHOT_POOL_MIB files spares by capacity and also takes back erased entries' buffers, so the
+    // pool may hold more than the one big buffer; the second big snapshot must still take the first one's spare.
+    const bool pooled = std::getenv("APS5_TEXTURE_SNAPSHOT_POOL_MIB") != nullptr;
     const auto bigFirst = Sampled(context, watchedFirst.Address(), BigSide);
-    Require(TextureCacheUsage().spareEntries == 1 && TextureCacheUsage().spareBytes == BigBytes, "the first big snapshot did not park its dropped " + std::to_string(BigBytes) + "-byte buffer in the spare pool");
+    if (pooled) Require(TextureCacheUsage().spareBytes >= BigBytes, "pooled: the first big snapshot did not park its dropped " + std::to_string(BigBytes) + "-byte buffer");
+    else Require(TextureCacheUsage().spareEntries == 1 && TextureCacheUsage().spareBytes == BigBytes, "the first big snapshot did not park its dropped " + std::to_string(BigBytes) + "-byte buffer in the spare pool");
+    const auto parked = TextureCacheUsage().spareBytes;
     const auto bigSecond = Sampled(context, watchedSecond.Address(), BigSide);
-    Require(TextureCacheUsage().spareEntries == 1 && TextureCacheUsage().spareBytes == BigBytes, "the second big snapshot did not take the parked spare of its size");
+    // Not taken, its own dropped buffer would add a second BigBytes spare; an evicted small entry may add its buffer (< BigBytes).
+    if (pooled) Require(TextureCacheUsage().spareBytes < parked + BigBytes, "pooled: the second big snapshot did not take the parked spare (spare bytes " + std::to_string(parked) + " -> " + std::to_string(TextureCacheUsage().spareBytes) + ")");
+    else Require(TextureCacheUsage().spareEntries == 1 && TextureCacheUsage().spareBytes == BigBytes, "the second big snapshot did not take the parked spare of its size (spares " + std::to_string(TextureCacheUsage().spareEntries) + ", " + std::to_string(TextureCacheUsage().spareBytes) + " bytes)");
 }
 
 void spareAgeTests(const Context& context) {
