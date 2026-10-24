@@ -1166,7 +1166,7 @@ std::size_t drawKindIndex(std::uint32_t opcode) {
 // B97 probe (10-24): why draws begin a render pass instead of continuing the previous one. Per 10 s under APS5_PROFILE_DRAW:
 // "[draw-passes] (10 s): continued N, begun N; forced: capture N, reads target N, GPU indirect with argument rewrite N,
 // GPU indirect without rewrite N, mesh indirect N, LDS subgroup N; begun unforced N".
-enum PassCount : std::size_t { PassContinued, PassBegun, ForcedCapture, ForcedReadsTarget, ForcedIndirectRewrite, ForcedIndirectPlain, ForcedMeshIndirect, ForcedLds, BegunUnforced, RewriteSameKey, RewriteNewKey, PassCounts };
+enum PassCount : std::size_t { PassContinued, PassBegun, ForcedCapture, ForcedReadsTarget, ForcedIndirectRewrite, ForcedIndirectPlain, ForcedMeshIndirect, ForcedLds, BegunUnforced, RewriteSameKey, RewriteNewKey, BatchHit, BatchBuilt, BatchRefused, PassCounts };
 std::array<std::atomic<std::uint64_t>, PassCounts> passCounts{};
 std::atomic<std::int64_t> passesReportedAt{0};
 
@@ -1191,11 +1191,12 @@ void countPassStart(bool continued, bool capture, bool readsTarget, bool gpuIndi
     if (now - last < 10 || !passesReportedAt.compare_exchange_strong(last, now, std::memory_order_relaxed)) return;
     std::array<std::uint64_t, PassCounts> c{};
     for (std::size_t i = 0; i < PassCounts; ++i) c[i] = passCounts[i].exchange(0, std::memory_order_relaxed);
-    std::fprintf(stderr, "[draw-passes] (10 s): continued %llu, begun %llu; forced: capture %llu, reads target %llu, GPU indirect with argument rewrite %llu, GPU indirect without rewrite %llu, mesh indirect %llu, LDS subgroup %llu; begun unforced %llu; rewrites with the previous rewrite's key %llu, with a new key %llu\n",
+    std::fprintf(stderr, "[draw-passes] (10 s): continued %llu, begun %llu; forced: capture %llu, reads target %llu, GPU indirect with argument rewrite %llu, GPU indirect without rewrite %llu, mesh indirect %llu, LDS subgroup %llu; begun unforced %llu; rewrites with the previous rewrite's key %llu, with a new key %llu; batched records: reused %llu, built %llu, refused %llu\n",
                  static_cast<unsigned long long>(c[PassContinued]), static_cast<unsigned long long>(c[PassBegun]), static_cast<unsigned long long>(c[ForcedCapture]),
                  static_cast<unsigned long long>(c[ForcedReadsTarget]), static_cast<unsigned long long>(c[ForcedIndirectRewrite]), static_cast<unsigned long long>(c[ForcedIndirectPlain]),
                  static_cast<unsigned long long>(c[ForcedMeshIndirect]), static_cast<unsigned long long>(c[ForcedLds]), static_cast<unsigned long long>(c[BegunUnforced]),
-                 static_cast<unsigned long long>(c[RewriteSameKey]), static_cast<unsigned long long>(c[RewriteNewKey]));
+                 static_cast<unsigned long long>(c[RewriteSameKey]), static_cast<unsigned long long>(c[RewriteNewKey]), static_cast<unsigned long long>(c[BatchHit]),
+                 static_cast<unsigned long long>(c[BatchBuilt]), static_cast<unsigned long long>(c[BatchRefused]));
 }
 
 void countDrawKind(const std::array<double, PhaseCount>& us) {
@@ -1907,6 +1908,83 @@ void recordDrawCommands(const Context& context, VkCommandBuffer commands, const 
 // the record's dword as the first vertex / instance, and the constant is what the fixed-function
 // fetch must start at). The scratch is kept until the batch completed. Returns whether a copy was
 // rewritten; `argumentBuffer`/`argumentOffset` receive where the draw reads the records.
+// B97 (10-24, APS5_INDIRECT_BATCH_REWRITE): the rewritten records of GPU-path indirect draws built on the CPU into a
+// host-visible window instead of a scratch copy recorded before each draw's pass. The records sit in guest memory; when no
+// recorded GPU write, label or queued store covers them, their bytes there are what the GPU would read, so the window is
+// read once, its Constant dwords set for every record slot, and kept: later draws with the same argument import, layout
+// and constants whose records lie on the window's stride grid read it at their offset, with no commands at all, so they
+// need no new render pass. A CPU write to the window (its write generation) or a GPU write over a draw's records drops it.
+struct BatchedArguments {
+    const Recorder* recorder = nullptr;
+    VkBuffer import = VK_NULL_HANDLE;
+    std::uint64_t base = 0;
+    std::size_t bytes = 0;
+    std::uint64_t generation = 0;
+    std::uint32_t stride = 0;
+    std::uint32_t recordBytes = 0;
+    bool vertexConstant = false;
+    bool instanceConstant = false;
+    std::uint32_t vertexValue = 0;
+    std::uint32_t instanceValue = 0;
+    std::shared_ptr<Buffer> buffer;
+};
+
+constexpr std::size_t BatchedArgumentWindow = 64u * 1024u;
+
+std::shared_ptr<Buffer> batchedArguments(const Context& context, Recorder& recorder, const IndirectRecord& indirect, VkDeviceSize& offset) {
+    using Rule = Pm4::DrawParameters::IndirectDraw::Rule;
+    const auto& args = *indirect.args;
+    const auto range = static_cast<std::size_t>(args.RangeBytes());
+    if (range == 0 || args.stride == 0 || args.stride % 4u != 0 || indirect.argumentImport == nullptr) return nullptr;
+    if (recorder.PendingWriteOverlaps(args.arguments, range) || recorder.PendingLabelIn(args.arguments, range) || recorder.QueuedStoreOverlaps(args.arguments, range)) {
+        passCounts[BatchRefused].fetch_add(1, std::memory_order_relaxed);
+        return nullptr;
+    }
+    const bool vertexConstant = args.vertexRule == Rule::Constant;
+    const bool instanceConstant = args.instanceRule == Rule::Constant;
+    thread_local BatchedArguments batched;
+    const bool sameKey = batched.buffer != nullptr && batched.recorder == &recorder && batched.import == indirect.argumentImport->buffer && batched.stride == args.stride &&
+                         batched.recordBytes == args.recordBytes && batched.vertexConstant == vertexConstant && batched.instanceConstant == instanceConstant &&
+                         (!vertexConstant || batched.vertexValue == args.vertexConstant) && (!instanceConstant || batched.instanceValue == args.instanceConstant);
+    if (sameKey && batched.generation != 0 && args.arguments >= batched.base && args.arguments + range <= batched.base + batched.bytes &&
+        (args.arguments - batched.base) % args.stride == 0 && GuestMemory::CollectWrites(batched.base, batched.bytes) == batched.generation) {
+        offset = static_cast<VkDeviceSize>(args.arguments - batched.base);
+        passCounts[BatchHit].fetch_add(1, std::memory_order_relaxed);
+        return batched.buffer;
+    }
+    auto bytes = std::max(range, BatchedArgumentWindow);
+    if (!GuestMemory::Accessible(reinterpret_cast<const void*>(static_cast<std::uintptr_t>(args.arguments)), bytes) || recorder.PendingWriteOverlaps(args.arguments, bytes) ||
+        recorder.PendingLabelIn(args.arguments, bytes) || recorder.QueuedStoreOverlaps(args.arguments, bytes)) bytes = range;
+    // Without a write generation the window can never be reused: copy only this draw's records.
+    auto generation = GuestMemory::CollectWrites(args.arguments, bytes);
+    if (generation == 0 && bytes != range) {
+        bytes = range;
+        generation = GuestMemory::CollectWrites(args.arguments, bytes);
+    }
+    batched = {};
+    batched.recorder = &recorder;
+    batched.import = indirect.argumentImport->buffer;
+    batched.base = args.arguments;
+    batched.bytes = bytes;
+    batched.generation = generation;
+    batched.stride = args.stride;
+    batched.recordBytes = args.recordBytes;
+    batched.vertexConstant = vertexConstant;
+    batched.instanceConstant = instanceConstant;
+    batched.vertexValue = args.vertexConstant;
+    batched.instanceValue = args.instanceConstant;
+    batched.buffer = std::make_shared<Buffer>(context, bytes, VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT);
+    auto span = batched.buffer->Bytes();
+    GuestMemory::Read(args.arguments, span, 4);
+    for (std::size_t slot = 0; slot + args.recordBytes <= bytes; slot += args.stride) {
+        if (vertexConstant) std::memcpy(span.data() + slot + args.VertexDwordOffset(), &args.vertexConstant, 4);
+        if (instanceConstant) std::memcpy(span.data() + slot + args.InstanceDwordOffset(), &args.instanceConstant, 4);
+    }
+    offset = 0;
+    passCounts[BatchBuilt].fetch_add(1, std::memory_order_relaxed);
+    return batched.buffer;
+}
+
 bool recordIndirectArguments(const Context& context, VkCommandBuffer commands, Recorder* recorder, bool recorded, const IndirectRecord& indirect, std::unique_ptr<DeviceBuffer>& scratch, VkBuffer& argumentBuffer, VkDeviceSize& argumentOffset, const std::function<void(std::uint32_t)>& countBarrier) {
     using Rule = Pm4::DrawParameters::IndirectDraw::Rule;
     const auto* args = indirect.args;
@@ -2312,7 +2390,11 @@ void recordDraw(const Context& context, const State& state, const Pm4::DrawParam
     // A continued pass is safe only when it began with an indirect draw's argument barrier (recordIndirectArguments:
     // ALL_COMMANDS -> DRAW_INDIRECT): the pass-start barrier does not cover indirect-command reads. Per recording thread.
     thread_local bool passHasIndirectBarrier = false;
-    const bool forcedByIndirect = gpuIndirect && (!forceOnlyRewrite || argumentsRewritten || !passHasIndirectBarrier);
+    static const bool batchRewrite = std::getenv("APS5_INDIRECT_BATCH_REWRITE") != nullptr;
+    VkDeviceSize batchOffset = 0;
+    const auto batchArguments = batchRewrite && argumentsRewritten && !meshIndirect && recorder != nullptr ? batchedArguments(context, *recorder, *record.indirect, batchOffset) : nullptr;
+    // A batched draw records no commands for its records (they are host-written before the submission), so nothing forces a pass.
+    const bool forcedByIndirect = gpuIndirect && batchArguments == nullptr && (!forceOnlyRewrite || argumentsRewritten || !passHasIndirectBarrier);
     if (argumentsRewritten && std::getenv("APS5_PROFILE_DRAW") != nullptr) {
         // B97 probe: would one keyed scratch serve this draw (same argument import, record layout and constants as the last)?
         thread_local std::array<std::uint64_t, 5> lastKey{};
@@ -2320,7 +2402,7 @@ void recordDraw(const Context& context, const State& state, const Pm4::DrawParam
         passCounts[key == lastKey ? RewriteSameKey : RewriteNewKey].fetch_add(1, std::memory_order_relaxed);
         lastKey = key;
     }
-    if (gpuIndirect && !forcedByIndirect) {
+    if (gpuIndirect && !forcedByIndirect && batchArguments == nullptr) {
         passReads.emplace_back(args->arguments, args->arguments + args->RangeBytes());
         if (args->countIndirect) passReads.emplace_back(args->countAddress, args->countAddress + 4);
     }
@@ -2392,7 +2474,11 @@ void recordDraw(const Context& context, const State& state, const Pm4::DrawParam
     bool rewritten = false;
     if (!meshIndirect && !inputs.restartTable.empty()) meshArguments = directMeshArguments(context, draw, inputs.restartTable);
     if (continued) {
-        if (gpuIndirect) {
+        if (batchArguments != nullptr) {
+            argumentBuffer = batchArguments->Handle();
+            argumentOffset = batchOffset;
+            rewritten = true;
+        } else if (gpuIndirect) {
             // Not rewritten (else the pass was forced): the draw reads its records in place; no commands inside the pass.
             recorder->NotePendingRead(args->arguments, static_cast<std::size_t>(args->RangeBytes()), Recorder::ReadKind::Indirect);
             if (args->countIndirect) recorder->NotePendingRead(args->countAddress, 4, Recorder::ReadKind::Indirect);
@@ -2421,6 +2507,10 @@ void recordDraw(const Context& context, const State& state, const Pm4::DrawParam
         if (meshIndirect) {
             meshArguments = recordMeshArguments(context, commands, recorder, true, state, draw, *record.indirect, countBarrier, inputs.restartTable);
             argumentBuffer = meshArguments->Handle();
+        } else if (batchArguments != nullptr) {
+            argumentBuffer = batchArguments->Handle();
+            argumentOffset = batchOffset;
+            rewritten = true;
         } else if (gpuIndirect) {
             rewritten = recordIndirectArguments(context, commands, recorder, true, *record.indirect, scratch, argumentBuffer, argumentOffset, countBarrier);
         }
@@ -2461,6 +2551,7 @@ void recordDraw(const Context& context, const State& state, const Pm4::DrawParam
         recordDrawCommands(context, commands, state, draw, inputs, record.indirect, argumentBuffer, argumentOffset);
     }
     if (meshArguments != nullptr) recorder->Keep(meshArguments);
+    if (batchArguments != nullptr) recorder->Keep(batchArguments);
     if (args != nullptr) CountIndirectDraw(record.indirect->path, record.indirect->readMs, rewritten);
     auto checkRecords = indirectRecordCheck(record.indirect);
     APS5_LOG_CHARS_OUT_DEBUG("Draw recorded");
