@@ -1849,13 +1849,78 @@ bool SameTable(const ReusedTable& table, VkDevice device, const ShaderRecompiler
     return table.device == device && table.words == binding.guestDescriptor && table.shapes == binding.imageShapes && table.depthCompare == binding.imageDepthCompare;
 }
 
-ReusedTable* FindReusedTable(VkDevice device, const ShaderRecompiler::DescriptorBinding& binding, const TableState& state) {
-    if (state.epoch == 0) return nullptr;
+// B100 probe (10-24): why bindless image tables are never reused ("image tables 0 reused, 53479 resolved" over a 107-min
+// real-play session). One line per 10 s under APS5_PROFILE_DRAW: "[table-reuse] (10 s): lookups N: disabled, skipped
+// (storage/no binding), none saved, all dropped by state, words differ, not current, textures not cached, reused; saved
+// tables dropped by a TableState change: epoch, unwatch, allocations, depth (a drop can count several fields); resolved
+// tables N (elements avg/max, us avg), builds with tables N; not kept: capacity, stored element, no binding, lookup not
+// exact, snapshot source, unwatched lookup, DCC; state moved during the resolve: epoch, unwatch, allocations, depth;
+// pending at save; kept; evicted (4 per thread)".
+enum TableProbeCount : std::size_t {
+    TpLookups, TpDisabled, TpSkipped, TpNoneSaved, TpAllDropped, TpWordsDiffer, TpNotCurrent, TpNotCached, TpReused,
+    TpDropEpoch, TpDropUnwatch, TpDropAllocations, TpDropDepth,
+    TpResolved, TpElements, TpResolveUs, TpBuildsWithTables,
+    TpNotKeptCapacity, TpNotKeptStored, TpNotKeptNoBinding, TpNotKeptLookup, TpNotKeptSource, TpNotKeptUnwatched, TpNotKeptDcc,
+    TpMovedEpoch, TpMovedUnwatch, TpMovedAllocations, TpMovedDepth, TpPendingAtSave, TpKept, TpEvicted, TableProbeCounts
+};
+std::array<std::atomic<std::uint64_t>, TableProbeCounts> tableProbeCounts{};
+std::atomic<std::uint64_t> tableProbeMaxElements{0};
+std::atomic<std::int64_t> tableProbeReportedAt{0};
+
+bool TableProbeOn() {
+    static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
+    return profile;
+}
+
+void countTableProbe(TableProbeCount what, std::uint64_t amount = 1) {
+    if (!TableProbeOn()) return;
+    tableProbeCounts[what].fetch_add(amount, std::memory_order_relaxed);
+}
+
+// Counts each TableState field that differs, at `first` (epoch), first + 1 (unwatch), + 2 (allocations), + 3 (depth).
+void countTableStateDiff(const TableState& before, const TableState& now, TableProbeCount first) {
+    if (before.epoch != now.epoch) countTableProbe(first);
+    if (before.unwatched != now.unwatched) countTableProbe(static_cast<TableProbeCount>(first + 1));
+    if (before.allocations != now.allocations) countTableProbe(static_cast<TableProbeCount>(first + 2));
+    if (before.depthSurfaces != now.depthSurfaces) countTableProbe(static_cast<TableProbeCount>(first + 3));
+}
+
+void reportTableProbe() {
+    if (!TableProbeOn()) return;
+    const auto now = std::chrono::duration_cast<std::chrono::seconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+    auto last = tableProbeReportedAt.load(std::memory_order_relaxed);
+    if (last == 0) { tableProbeReportedAt.compare_exchange_strong(last, now, std::memory_order_relaxed); return; }
+    if (now - last < 10 || !tableProbeReportedAt.compare_exchange_strong(last, now, std::memory_order_relaxed)) return;
+    std::array<unsigned long long, TableProbeCounts> c{};
+    for (std::size_t i = 0; i < TableProbeCounts; ++i) c[i] = static_cast<unsigned long long>(tableProbeCounts[i].exchange(0, std::memory_order_relaxed));
+    const auto maxElements = static_cast<unsigned long long>(tableProbeMaxElements.exchange(0, std::memory_order_relaxed));
+    const double resolved = c[TpResolved] != 0 ? static_cast<double>(c[TpResolved]) : 1.0;
+    AgcDriver::ProfilePrint_nid_no_patch("[table-reuse] (10 s): lookups %llu: disabled %llu, skipped %llu, none saved %llu, all dropped by state %llu, words differ %llu, not current %llu, textures not cached %llu, reused %llu; saved tables dropped by state: epoch %llu, unwatch %llu, allocations %llu, depth %llu; resolved %llu (elements avg %.0f max %llu, %.0f us avg), builds with tables %llu; not kept: capacity %llu, stored element %llu, no binding %llu, lookup not exact %llu, snapshot source %llu, unwatched lookup %llu, DCC %llu; state moved during the resolve: epoch %llu, unwatch %llu, allocations %llu, depth %llu; pending at save %llu; kept %llu; evicted %llu\n",
+        c[TpLookups], c[TpDisabled], c[TpSkipped], c[TpNoneSaved], c[TpAllDropped], c[TpWordsDiffer], c[TpNotCurrent], c[TpNotCached], c[TpReused],
+        c[TpDropEpoch], c[TpDropUnwatch], c[TpDropAllocations], c[TpDropDepth],
+        c[TpResolved], static_cast<double>(c[TpElements]) / resolved, maxElements, static_cast<double>(c[TpResolveUs]) / resolved, c[TpBuildsWithTables],
+        c[TpNotKeptCapacity], c[TpNotKeptStored], c[TpNotKeptNoBinding], c[TpNotKeptLookup], c[TpNotKeptSource], c[TpNotKeptUnwatched], c[TpNotKeptDcc],
+        c[TpMovedEpoch], c[TpMovedUnwatch], c[TpMovedAllocations], c[TpMovedDepth], c[TpPendingAtSave], c[TpKept], c[TpEvicted]);
+}
+
+// probed: the [table-reuse] lookup outcomes count resolveImageTables' lookups only; drops count from every caller.
+ReusedTable* FindReusedTable(VkDevice device, const ShaderRecompiler::DescriptorBinding& binding, const TableState& state, bool probed = true) {
+    if (probed) countTableProbe(TpLookups);
+    if (state.epoch == 0) {
+        if (probed) countTableProbe(TpDisabled);
+        return nullptr;
+    }
     auto& tables = ReusedTables();
-    std::erase_if(tables, [&](const ReusedTable& table) { return table.state != state; });
+    const bool hadSaved = !tables.empty();
+    std::erase_if(tables, [&](const ReusedTable& table) {
+        if (table.state == state) return false;
+        countTableStateDiff(table.state, state, TpDropEpoch);
+        return true;
+    });
     for (auto& table : tables) {
         if (SameTable(table, device, binding)) return &table;
     }
+    if (probed) countTableProbe(!hadSaved ? TpNoneSaved : tables.empty() ? TpAllDropped : TpWordsDiffer);
     return nullptr;
 }
 
@@ -1894,7 +1959,10 @@ void RememberTable(ReusedTable&& table, const ShaderRecompiler::DescriptorBindin
     table.shapes = binding.imageShapes;
     table.depthCompare = binding.imageDepthCompare;
     tables.insert(tables.begin(), std::move(table));
-    if (tables.size() > ReusedTableCount) tables.resize(ReusedTableCount);
+    if (tables.size() > ReusedTableCount) {
+        countTableProbe(TpEvicted, tables.size() - ReusedTableCount);
+        tables.resize(ReusedTableCount);
+    }
 }
 
 std::string HexText(std::uint64_t value) {
@@ -3508,7 +3576,7 @@ bool ShaderResources::revalidateFull(std::span<const CompiledShader> shaders, Pr
             const auto* images = tableImages(shaders, table.stage);
             if (images == nullptr || images->count != table.elementTextures.size()) return false;
             std::vector<std::shared_ptr<Texture>> cached;
-            if (auto* reused = FindReusedTable(context.device, *images, CurrentTableState()); reused != nullptr && TableCurrent(*reused) && CachedTableTextures(*reused, cached)) {
+            if (auto* reused = FindReusedTable(context.device, *images, CurrentTableState(), false); reused != nullptr && TableCurrent(*reused) && CachedTableTextures(*reused, cached)) {
                 auto next = cached.begin();
                 bool same = true;
                 for (std::uint32_t element = 0; same && element < images->count; ++element) {
@@ -5071,6 +5139,7 @@ void ShaderResources::resolveImageTables() {
     const auto none = [](const std::array<std::size_t, 2>& set) { return set[0] == std::numeric_limits<std::size_t>::max() && set[1] == std::numeric_limits<std::size_t>::max(); };
     if (none(tableBindings) && none(storageTableBindings)) return;
     auto& counters = TextureCounts();
+    std::uint64_t tablesThisBuild = 0;
     for (std::size_t set = 0; set < tableBindings.size(); ++set) {
         if (storageTableBindings[set] != std::numeric_limits<std::size_t>::max()) bindings[storageTableBindings[set]].imageAllocations.assign(std::min(tableElements[set], StorageTableCapacity(context)), std::numeric_limits<std::size_t>::max());
         if (tableBindings[set] != std::numeric_limits<std::size_t>::max()) bindings[tableBindings[set]].imageAllocations.assign(std::min(tableElements[set], context.imageTableCapacity), std::numeric_limits<std::size_t>::max());
@@ -5121,7 +5190,18 @@ void ShaderResources::resolveImageTables() {
         const auto state = CurrentTableState();
         std::vector<std::shared_ptr<Texture>> cached;
         const bool storageTable = std::find(binding.imageWritten.begin(), binding.imageWritten.end(), true) != binding.imageWritten.end();
-        if (auto* reused = storageTable || item == nullptr ? nullptr : FindReusedTable(context.device, binding, state); reused != nullptr && TableCurrent(*reused) && CachedTableTextures(*reused, cached)) {
+        auto* reused = storageTable || item == nullptr ? nullptr : FindReusedTable(context.device, binding, state);
+        if (storageTable || item == nullptr) {
+            countTableProbe(TpSkipped);
+        } else if (reused != nullptr && !TableCurrent(*reused)) {
+            countTableProbe(TpNotCurrent);
+            reused = nullptr;
+        } else if (reused != nullptr && !CachedTableTextures(*reused, cached)) {
+            countTableProbe(TpNotCached);
+            reused = nullptr;
+        }
+        if (reused != nullptr) {
+            countTableProbe(TpReused);
             const bool replay = TableReplay() && reused->replayable && reused->imageSamplers == binding.imageSamplers && reused->samplers == samplerKey;
             if (!replay) reused->bound.assign(binding.count, {});
             auto next = cached.begin();
@@ -5156,12 +5236,20 @@ void ShaderResources::resolveImageTables() {
         ReusedTable fresh;
         fresh.bound.assign(binding.count, {});
         bool reusable = state.epoch != 0;
+        // B100 probe: the first reason the table stops being reusable.
+        auto notKept = TableProbeCounts;
+        const auto dropReuse = [&](TableProbeCount why) {
+            if (reusable) notKept = why;
+            reusable = false;
+        };
+        const auto resolveStart = std::chrono::steady_clock::now();
+        ++tablesThisBuild;
         for (std::uint32_t element = 0; element < binding.count; ++element) {
             const auto words = std::span<const std::uint32_t>(binding.guestDescriptor).subspan(static_cast<std::size_t>(element) * 8u, 8u);
             const auto absolute = static_cast<std::uint64_t>(table.elementBase) + element;
             if (absolute >= context.imageTableCapacity) {
                 table.map[faults + element] = rejectTableElement(table, words, capacityMessage());
-                reusable = false;
+                dropReuse(TpNotKeptCapacity);
                 continue;
             }
             GuestTextureResource resource{};
@@ -5184,7 +5272,7 @@ void ShaderResources::resolveImageTables() {
                 continue;
             }
             if (element < binding.imageWritten.size() && binding.imageWritten[element]) {
-                reusable = false;
+                dropReuse(TpNotKeptStored);
                 const auto storageBinding = storageTableBindings[table.set];
                 if (storageBinding == std::numeric_limits<std::size_t>::max()) {
                     table.map[faults + element] = rejectTableElement(table, words, "set " + std::to_string(table.set) + " has no image storage table, but the shader stores to its table element " + std::to_string(absolute));
@@ -5219,7 +5307,7 @@ void ShaderResources::resolveImageTables() {
             }
             if (item == nullptr) {
                 table.map[faults + element] = rejectTableElement(table, words, "a sampled image table entry has no sampled image table binding");
-                reusable = false;
+                dropReuse(TpNotKeptNoBinding);
                 continue;
             }
             std::array<std::uint32_t, 8> narrowed{};
@@ -5244,7 +5332,10 @@ void ShaderResources::resolveImageTables() {
             if (reusable) {
                 const auto& log = lookupLog();
                 const auto* looked = log.empty() ? nullptr : &log.back();
-                reusable = looked != nullptr && looked->object == texture.get() && looked->source == nullptr && looked->generation != 0 && looked->keys == DccKeys::Uncompressed && resource.dccAddress == 0;
+                if (looked == nullptr || looked->object != texture.get()) dropReuse(TpNotKeptLookup);
+                else if (looked->source != nullptr) dropReuse(TpNotKeptSource);
+                else if (looked->generation == 0) dropReuse(TpNotKeptUnwatched);
+                else if (looked->keys != DccKeys::Uncompressed || resource.dccAddress != 0) dropReuse(TpNotKeptDcc);
                 if (reusable) {
                     fresh.elements.push_back({MakeTextureKey(context.device, sampledWords, components, depthCompare), texture, resource, guestBytes, firstLayer, false, {}});
                     fresh.queries.push_back({resource.baseAddress, static_cast<std::size_t>(guestBytes), looked->generation});
@@ -5254,9 +5345,23 @@ void ShaderResources::resolveImageTables() {
             fresh.bound[element] = bind(element, sampledWords, std::move(texture), resource, guestBytes, firstLayer);
         }
         counters.tablesResolved.fetch_add(1, std::memory_order_relaxed);
+        if (TableProbeOn()) {
+            countTableProbe(TpResolved);
+            countTableProbe(TpElements, binding.count);
+            countTableProbe(TpResolveUs, static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - resolveStart).count()));
+            auto seen = tableProbeMaxElements.load(std::memory_order_relaxed);
+            while (seen < binding.count && !tableProbeMaxElements.compare_exchange_weak(seen, binding.count, std::memory_order_relaxed)) {}
+            if (!reusable) {
+                if (notKept != TableProbeCounts) countTableProbe(notKept);
+            } else if (const auto after = CurrentTableState(); after != state) {
+                countTableStateDiff(state, after, TpMovedEpoch);
+            }
+        }
         if (reusable && CurrentTableState() == state) {
             const auto serial = StorageTexture::PendingSerial();
-            if (!StorageTexture::AnyPendingOverlaps(fresh.ranges) && StorageTexture::PendingSerial() == serial) {
+            const bool pending = StorageTexture::AnyPendingOverlaps(fresh.ranges) || StorageTexture::PendingSerial() != serial;
+            countTableProbe(pending ? TpPendingAtSave : TpKept);
+            if (!pending) {
                 fresh.device = context.device;
                 fresh.state = state;
                 fresh.pendingSerial = serial;
@@ -5267,7 +5372,9 @@ void ShaderResources::resolveImageTables() {
             }
         }
     }
+    if (tablesThisBuild != 0) countTableProbe(TpBuildsWithTables);
     reportTextureCounters();
+    reportTableProbe();
 }
 
 std::uint64_t SampledLookupKeyScans() {
