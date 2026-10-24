@@ -841,7 +841,7 @@ struct SpecializedModule {
     bool pushData = false;
 };
 
-std::shared_ptr<const SpecializedModule> buildSpecializedModule(const CompiledShaderArtifact& artifact, std::span<const std::uint32_t> classes, std::span<const PipelineSpecializationConstant> constants, const SpirvTarget& target) {
+std::shared_ptr<const SpecializedModule> buildSpecializedModule(const CompiledShaderArtifact& artifact, std::span<const std::uint32_t> classes, std::span<const PipelineSpecializationConstant> constants, const SpirvTarget& target, std::uint64_t id = 0) {
     auto source = SpecializeVertexInputTypes(artifact, classes);
     std::map<std::uint32_t, std::uint32_t> supplied;
     for (const auto& constant : constants) {
@@ -950,7 +950,8 @@ std::shared_ptr<const SpecializedModule> buildSpecializedModule(const CompiledSh
         cursor += count;
     }
     module->spirv = InternSpirv(std::move(materialized));
-    module->specializationId = constants.empty() ? 0u : nextVariantId();
+    // B59a: a module rebuilt after an eviction keeps the id it had (id != 0), so PipelineVariantId and the Vulkan pipeline stay the same.
+    module->specializationId = constants.empty() ? 0u : (id != 0 ? id : nextVariantId());
     return module;
 }
 
@@ -958,7 +959,38 @@ struct SpecializedModuleEntry {
     std::once_flag ready;
     std::exception_ptr failure;
     std::shared_ptr<const SpecializedModule> module;
+    // B59a bookkeeping (only with APS5_SPECIALIZED_MODULE_CACHE_MIB): last use, and the bytes counted once the build finished.
+    std::atomic<std::uint64_t> used{0};
+    std::atomic<bool> counted{false};
+    std::uint64_t bytes = 0;
 };
+
+// B59a (10-25): APS5_SPECIALIZED_MODULE_CACHE_MIB=N bounds specializeModule's cache to N MiB of SPIR-V (least recently used ready
+// entries are evicted) and makes InternSpirv hold weak references; "Nk" / "Nb" give KiB / bytes. Unset or 0: unbounded, today's behaviour.
+std::uint64_t SpecializedModuleCapBytes() {
+    static const std::uint64_t cap = [] {
+        const char* value = std::getenv("APS5_SPECIALIZED_MODULE_CACHE_MIB");
+        if (value == nullptr) return std::uint64_t{0};
+        char* end = nullptr;
+        const auto amount = static_cast<std::uint64_t>(std::strtoull(value, &end, 10));
+        if (end == value) return std::uint64_t{0};
+        // N = MiB; "Nk" = KiB and "Nb" = bytes, so a unit test can force evictions with a few small modules.
+        if (*end == 'k' || *end == 'K') return amount << 10u;
+        if (*end == 'b' || *end == 'B') return amount;
+        return amount << 20u;
+    }();
+    return cap;
+}
+
+struct SpecializedModuleCounters {
+    std::atomic<std::uint64_t> built{0}, hits{0}, evicted{0}, rebuilt{0}, internLive{0}, internDropped{0};
+    std::atomic<std::int64_t> lastReport{0};
+};
+
+SpecializedModuleCounters& specializedModuleCounters() {
+    static SpecializedModuleCounters counters;
+    return counters;
+}
 
 struct PreparedModuleEntry {
     std::once_flag ready;
@@ -1065,11 +1097,20 @@ std::shared_ptr<const SpecializedModule> specializeModule(const CompiledShaderAr
     for (const auto& constant : constants) key.push_back((static_cast<std::uint64_t>(constant.id) << 32u) | constant.value);
     static PrimedSharedMutex mutex;
     static std::map<std::vector<std::uint64_t>, std::shared_ptr<SpecializedModuleEntry>> modules;
+    // B59a state, guarded by `mutex`: SPIR-V bytes of the counted entries, and the specializationId each key was given.
+    static std::uint64_t moduleBytes = 0;
+    static std::unordered_map<std::uint64_t, std::uint64_t> ids;
+    static std::atomic<std::uint64_t> clock{0};
+    const auto cap = SpecializedModuleCapBytes();
+    auto& counters = specializedModuleCounters();
+    std::uint64_t keyHash = 0xcbf29ce484222325ull;
+    for (const auto word : key) keyHash = (keyHash ^ word) * 0x100000001b3ull;
     std::shared_ptr<SpecializedModuleEntry> entry;
     {
         std::shared_lock lock(mutex);
         if (const auto found = modules.find(key); found != modules.end()) entry = found->second;
     }
+    if (entry != nullptr && cap != 0) counters.hits.fetch_add(1, std::memory_order_relaxed);
     if (entry == nullptr) {
         std::unique_lock lock(mutex);
         const auto found = modules.find(key);
@@ -1077,12 +1118,53 @@ std::shared_ptr<const SpecializedModule> specializeModule(const CompiledShaderAr
     }
     std::call_once(entry->ready, [&] {
         try {
-            entry->module = buildSpecializedModule(artifact, classes, constants, target);
+            std::uint64_t stableId = 0;
+            if (cap != 0) {
+                std::shared_lock lock(mutex);
+                if (const auto found = ids.find(keyHash); found != ids.end()) stableId = found->second;
+            }
+            entry->module = buildSpecializedModule(artifact, classes, constants, target, stableId);
+            if (stableId != 0) counters.rebuilt.fetch_add(1, std::memory_order_relaxed);
         } catch (...) {
             entry->failure = std::current_exception();
         }
     });
     if (entry->failure) std::rethrow_exception(entry->failure);
+    if (cap != 0) {
+        entry->used.store(clock.fetch_add(1, std::memory_order_relaxed) + 1, std::memory_order_relaxed);
+        if (!entry->counted.load(std::memory_order_acquire)) {
+            std::unique_lock lock(mutex);
+            if (!entry->counted.load(std::memory_order_relaxed) && entry->module != nullptr) {
+                entry->bytes = static_cast<std::uint64_t>(entry->module->spirv.size()) * 4u;
+                moduleBytes += entry->bytes;
+                if (entry->module->specializationId != 0) {
+                    if (ids.size() >= (1u << 20u)) ids.clear();
+                    ids[keyHash] = entry->module->specializationId;
+                }
+                entry->counted.store(true, std::memory_order_release);
+                counters.built.fetch_add(1, std::memory_order_relaxed);
+                // Evict the least recently used counted entries (never this one) until the cache fits. Users keep their
+                // shared_ptr, so an eviction drops only the cache's reference.
+                while (moduleBytes > cap) {
+                    auto victim = modules.end();
+                    for (auto it = modules.begin(); it != modules.end(); ++it) {
+                        if (it->second == entry || !it->second->counted.load(std::memory_order_relaxed)) continue;
+                        if (victim == modules.end() || it->second->used.load(std::memory_order_relaxed) < victim->second->used.load(std::memory_order_relaxed)) victim = it;
+                    }
+                    if (victim == modules.end()) break;
+                    moduleBytes -= victim->second->bytes;
+                    modules.erase(victim);
+                    counters.evicted.fetch_add(1, std::memory_order_relaxed);
+                }
+                static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
+                const auto now = std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+                auto last = counters.lastReport.load(std::memory_order_relaxed);
+                if (profile && now - last >= 10'000'000'000ll && counters.lastReport.compare_exchange_strong(last, now, std::memory_order_relaxed)) {
+                    std::fprintf(stderr, "[specialized-modules] (10 s): entries %zu, MiB %.1f, cap %llu MiB, built %llu, hits %llu, evicted %llu, rebuilt after eviction %llu; interned live %llu, expired dropped %llu\n", modules.size(), static_cast<double>(moduleBytes) / 1048576.0, static_cast<unsigned long long>(cap >> 20u), static_cast<unsigned long long>(counters.built.exchange(0, std::memory_order_relaxed)), static_cast<unsigned long long>(counters.hits.exchange(0, std::memory_order_relaxed)), static_cast<unsigned long long>(counters.evicted.exchange(0, std::memory_order_relaxed)), static_cast<unsigned long long>(counters.rebuilt.exchange(0, std::memory_order_relaxed)), static_cast<unsigned long long>(counters.internLive.load(std::memory_order_relaxed)), static_cast<unsigned long long>(counters.internDropped.exchange(0, std::memory_order_relaxed)));
+                }
+            }
+        }
+    }
     return entry->module;
 }
 
@@ -1182,7 +1264,11 @@ RecompileResult materializeResult(const CompiledVariant& variant, const Recompil
             const auto found = plan->modules.find(moduleKey);
             entry = found != plan->modules.end() ? found->second : plan->modules.emplace(moduleKey, std::make_shared<PreparedModuleEntry>()).first->second;
         }
-        const auto prepare = [&] {
+        // B59a: with APS5_SPECIALIZED_MODULE_CACHE_MIB the prepared entry keeps only its selected bindings, not the module, and
+        // the registration map is bypassed: both held every module forever, so bounding specializeModule alone freed nothing.
+        // Each use then takes the module from specializeModule's bounded cache (same key: variant + constants; same stable id).
+        const bool moduleCap = SpecializedModuleCapBytes() != 0;
+        const auto specializationConstants = [&] {
             auto constants = plan->bindings.specialization;
             std::size_t index = 0;
             if (variant.bindings.layout.UsesPushData()) constants.push_back({PipelineSpecialization::PushDataOffset, moduleKey[index++]});
@@ -1207,11 +1293,15 @@ RecompileResult materializeResult(const CompiledVariant& variant, const Recompil
                     constants.push_back({first + 5u, kind});
                 }
             }
-            const auto module = artifact.registrationModule && plan->bindings.specialization.empty() ? registrationModule(artifact.variantId, moduleKey, [&] { return specializeModule(variant.artifact, vertexClasses, constants, request.target); }) : specializeModule(variant.artifact, vertexClasses, constants, request.target);
+            return constants;
+        };
+        const auto prepare = [&] {
+            const auto constants = specializationConstants();
+            const auto module = !moduleCap && artifact.registrationModule && plan->bindings.specialization.empty() ? registrationModule(artifact.variantId, moduleKey, [&] { return specializeModule(variant.artifact, vertexClasses, constants, request.target); }) : specializeModule(variant.artifact, vertexClasses, constants, request.target);
             if (variant.bindings.layout.UsesPushData() && !module->pushData) throw std::runtime_error("specialization removed the prepared push constant interface");
             auto selected = DescriptorBindingBuilder{}.Select(plan->bindings, module->bindings);
             entry->bindings = std::move(selected);
-            entry->module = module;
+            if (!moduleCap) entry->module = module;
         };
         std::call_once(entry->ready, [&] {
             try {
@@ -1221,7 +1311,8 @@ RecompileResult materializeResult(const CompiledVariant& variant, const Recompil
             }
         });
         if (entry->failure) std::rethrow_exception(entry->failure);
-        const auto& module = entry->module;
+        std::shared_ptr<const SpecializedModule> module = entry->module;
+        if (moduleCap) module = specializeModule(variant.artifact, vertexClasses, specializationConstants(), request.target);
         result.specializationId = module->specializationId;
         result.spirv = module->spirv;
         bindingPlan = &entry->bindings;
@@ -1280,6 +1371,40 @@ bool sameLayout(const BindingLayout& left, const BindingLayout& right) {
 SharedSpirv InternSpirv(std::vector<std::uint32_t> words) {
     SharedSpirv spirv(std::move(words));
     const auto hash = spirv.ContentHash();
+    if (SpecializedModuleCapBytes() != 0) {
+        // B59a bounded mode: weak references, so a module nobody holds any more is freed. Expired candidates are dropped while
+        // scanning their bucket, and every 4096 inserts the whole table is swept.
+        static std::mutex weakMutex;
+        static std::unordered_map<std::uint64_t, std::vector<std::weak_ptr<const void>>> weakInterned;
+        static std::uint64_t inserts = 0;
+        auto& counters = specializedModuleCounters();
+        std::lock_guard lock(weakMutex);
+        auto& candidates = weakInterned[hash.low ^ (hash.high * 0x9e3779b97f4a7c15ull)];
+        for (auto it = candidates.begin(); it != candidates.end();) {
+            const auto live = SharedSpirv::FromWeak(*it);
+            if (live.empty()) {
+                it = candidates.erase(it);
+                counters.internLive.fetch_sub(1, std::memory_order_relaxed);
+                counters.internDropped.fetch_add(1, std::memory_order_relaxed);
+                continue;
+            }
+            if (live.ContentHash() == hash && live == spirv) return live;
+            ++it;
+        }
+        candidates.push_back(spirv.Weak());
+        counters.internLive.fetch_add(1, std::memory_order_relaxed);
+        if (++inserts % 4096u == 0) {
+            for (auto bucket = weakInterned.begin(); bucket != weakInterned.end();) {
+                const auto before = bucket->second.size();
+                std::erase_if(bucket->second, [](const std::weak_ptr<const void>& weak) { return weak.expired(); });
+                const auto dropped = before - bucket->second.size();
+                counters.internLive.fetch_sub(dropped, std::memory_order_relaxed);
+                counters.internDropped.fetch_add(dropped, std::memory_order_relaxed);
+                bucket = bucket->second.empty() ? weakInterned.erase(bucket) : std::next(bucket);
+            }
+        }
+        return spirv;
+    }
     static std::mutex mutex;
     static std::unordered_map<std::uint64_t, std::vector<SharedSpirv>> interned;
     std::lock_guard lock(mutex);

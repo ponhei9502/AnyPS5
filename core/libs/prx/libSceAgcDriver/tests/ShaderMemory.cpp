@@ -1421,6 +1421,33 @@ std::array<std::uint32_t, 8> TableSelected(const ShaderRecompiler::ImageTableSna
     return column.words.at(column.codes[0]).dwords;
 }
 
+// B59a (10-25): with APS5_SPECIALIZED_MODULE_CACHE_MIB=1b every new specialized module evicts the others. A module rebuilt after
+// its eviction must keep its specializationId (so PipelineVariantId and the Vulkan pipeline stay the same) and its SPIR-V.
+// Run only through --specialized-module-cache, which sets the switches before the first lookup.
+void verifySpecializedModuleCacheEviction() {
+    using namespace ShaderRecompiler;
+    static TableTexture textures[2];
+    alignas(4096) static TableGuest guest;
+    std::fill(guest.heap.begin(), guest.heap.end(), std::array<std::uint32_t, 8>{});
+    guest.heap[0] = TableT(textures[0].bytes.data(), TableFormat8888UNorm, TableType2D);
+    guest.heap[1] = TableT(textures[1].bytes.data(), TableFormat32UInt, TableType2D);
+    guest.materials = {{{0u, 1u, 0u, 0u}, {0u, 0u, 0u, 0u}, {0u, 1u, 0u, 0u}}};
+    FillTableSrt(guest, guest.heap.data(), 32u, 2u);
+    const auto userData = TableUserData(guest);
+    const auto requestA = TableRequest(TableMaterialCode, userData);
+    const auto requestB = TableRequest(TableWholeCode, userData);
+    const auto first = CompileTable(requestA);
+    const auto other = CompileTable(requestB);
+    const auto again = CompileTable(requestA);
+    const auto& a = *first.result;
+    const auto& b = *other.result;
+    const auto& c = *again.result;
+    require(a.specializationId != 0u, "specialized module cache: the table shader has no specialization (the test would prove nothing)");
+    require(a.variantId != b.variantId || a.specializationId != b.specializationId, "specialized module cache: the two shaders share one module (no eviction happens)");
+    require(a.PipelineVariantId() == c.PipelineVariantId() && a.specializationId == c.specializationId, "specialized module cache: a module rebuilt after its eviction got a new pipeline id");
+    require(a.spirv == c.spirv, "specialized module cache: the rebuilt module's SPIR-V differs");
+}
+
 void verifyImageTableKeys() {
     using namespace ShaderRecompiler;
     namespace Abi = ImageTableAbi;
@@ -7953,6 +7980,15 @@ int main(int argc, char** argv) {
         setenv("ANYPS5_NO_SHADER_CACHE", "1", 1);
 #endif
         using namespace ShaderRecompiler;
+        if (argc == 2 && std::string_view(argv[1]) == "--specialized-module-cache") {
+#ifndef _WIN32
+            setenv("APS5_SPECIALIZED_MODULE_CACHE_MIB", "1b", 1);
+            setenv("APS5_NO_RESULT_MEMO", "1", 1);
+            verifySpecializedModuleCacheEviction();
+            std::cout << "A specialized module rebuilt after its eviction keeps its pipeline id and SPIR-V\n";
+#endif
+            return 0;
+        }
         if (argc == 2 && std::string_view(argv[1]) == "--specialized-bda-abi") {
             verifySpecializedBufferAtomicBindings(true);
             std::cout << "Specialized programs retain the BDA ABI only while a fault buffer remains\n";

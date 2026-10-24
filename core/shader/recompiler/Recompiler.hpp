@@ -626,6 +626,18 @@ public:
     void resize(std::size_t count) { Mutable().resize(count); }
     std::vector<std::uint32_t>::iterator insert(std::vector<std::uint32_t>::const_iterator where, std::initializer_list<std::uint32_t> values) { return Mutable().insert(where, values); }
     friend bool operator==(const SharedSpirv& left, const SharedSpirv& right) { return std::ranges::equal(left.Words(), right.Words()); }
+    // B59a (APS5_SPECIALIZED_MODULE_CACHE_MIB): weak handles for InternSpirv's bounded mode. A holder handed out weakly is marked
+    // interned, so Mutable() copies it instead of writing in place (another thread may revive it through the intern table).
+    [[nodiscard]] std::weak_ptr<const void> Weak() const {
+        if (holder == nullptr) return {};
+        holder->interned.store(true, std::memory_order_relaxed);
+        return std::weak_ptr<const void>(std::shared_ptr<const void>(holder));
+    }
+    [[nodiscard]] static SharedSpirv FromWeak(const std::weak_ptr<const void>& weak) {
+        SharedSpirv spirv;
+        if (auto locked = weak.lock()) spirv.holder = std::const_pointer_cast<Holder>(std::static_pointer_cast<const Holder>(locked));
+        return spirv;
+    }
 
 private:
     struct Holder {
@@ -637,10 +649,11 @@ private:
         mutable std::atomic<std::uint64_t> hashLow{0};
         mutable std::atomic<std::uint64_t> hashHigh{0};
         mutable std::atomic<bool> hashed{false};
+        mutable std::atomic<bool> interned{false};
     };
 
     std::vector<std::uint32_t>& Mutable() {
-        if (holder == nullptr || holder.use_count() != 1 || holder->owner != nullptr) {
+        if (holder == nullptr || holder.use_count() != 1 || holder->owner != nullptr || holder->interned.load(std::memory_order_relaxed)) {
             holder = std::make_shared<Holder>(Copy(), nullptr, std::span<const std::uint32_t>{});
         } else {
             holder->hashed.store(false, std::memory_order_relaxed);
