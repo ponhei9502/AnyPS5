@@ -33,6 +33,8 @@
 #include <vector>
 #ifdef _WIN32
 #include <windows.h>
+#else
+#include <sys/mman.h>
 #endif
 
 extern "C" int APS5_VABI sceAgcDriverSetTFRing(const volatile void* base, std::uint32_t size);
@@ -191,7 +193,31 @@ void mapHostRanges(const FrameCaptureReader& reader, Skipped& skipped) {
         skipped.Add(*chunk);
     }
 #else
-    for (const auto* chunk : host) skipped.Add(*chunk);
+    // Linux: host ranges (the title's own ELF data, host heaps the GPU reads) are mapped at their recorded addresses where this
+    // process has nothing; a collision is skipped, or fails the replay for a GPU-visible range, as on Windows.
+    constexpr std::uint64_t Granularity = 4096u;
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> envelopes;
+    for (const auto* chunk : host) {
+        const auto begin = chunk->address & ~(Granularity - 1);
+        const auto end = (chunk->address + chunk->bytes + Granularity - 1) & ~(Granularity - 1);
+        if (!envelopes.empty() && begin <= envelopes.back().second) envelopes.back().second = std::max(envelopes.back().second, end);
+        else envelopes.emplace_back(begin, end);
+    }
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> refused;
+    for (const auto& [begin, end] : envelopes) {
+        void* const wanted = reinterpret_cast<void*>(static_cast<std::uintptr_t>(begin));
+        void* const placed = mmap(wanted, static_cast<std::size_t>(end - begin), PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE | MAP_FIXED_NOREPLACE, -1, 0);
+        if (placed == MAP_FAILED || placed != wanted) {
+            if (placed != MAP_FAILED) munmap(placed, static_cast<std::size_t>(end - begin));
+            refused.emplace_back(begin, end);
+        }
+    }
+    for (const auto* chunk : host) {
+        const bool blocked = std::any_of(refused.begin(), refused.end(), [&](const auto& range) { return chunk->address < range.second && range.first < chunk->address + chunk->bytes; });
+        if (!blocked) continue;
+        if ((chunk->access & FrameRangeAccess::Gpu) != 0) throw std::runtime_error("frame replay: cannot map the GPU-visible host range at " + std::to_string(chunk->address));
+        skipped.Add(*chunk);
+    }
 #endif
 }
 
