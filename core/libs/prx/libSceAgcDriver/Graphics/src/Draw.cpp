@@ -1166,7 +1166,7 @@ std::size_t drawKindIndex(std::uint32_t opcode) {
 // B97 probe (10-24): why draws begin a render pass instead of continuing the previous one. Per 10 s under APS5_PROFILE_DRAW:
 // "[draw-passes] (10 s): continued N, begun N; forced: capture N, reads target N, GPU indirect with argument rewrite N,
 // GPU indirect without rewrite N, mesh indirect N, LDS subgroup N; begun unforced N".
-enum PassCount : std::size_t { PassContinued, PassBegun, ForcedCapture, ForcedReadsTarget, ForcedIndirectRewrite, ForcedIndirectPlain, ForcedMeshIndirect, ForcedLds, BegunUnforced, PassCounts };
+enum PassCount : std::size_t { PassContinued, PassBegun, ForcedCapture, ForcedReadsTarget, ForcedIndirectRewrite, ForcedIndirectPlain, ForcedMeshIndirect, ForcedLds, BegunUnforced, RewriteSameKey, RewriteNewKey, PassCounts };
 std::array<std::atomic<std::uint64_t>, PassCounts> passCounts{};
 std::atomic<std::int64_t> passesReportedAt{0};
 
@@ -1191,10 +1191,11 @@ void countPassStart(bool continued, bool capture, bool readsTarget, bool gpuIndi
     if (now - last < 10 || !passesReportedAt.compare_exchange_strong(last, now, std::memory_order_relaxed)) return;
     std::array<std::uint64_t, PassCounts> c{};
     for (std::size_t i = 0; i < PassCounts; ++i) c[i] = passCounts[i].exchange(0, std::memory_order_relaxed);
-    std::fprintf(stderr, "[draw-passes] (10 s): continued %llu, begun %llu; forced: capture %llu, reads target %llu, GPU indirect with argument rewrite %llu, GPU indirect without rewrite %llu, mesh indirect %llu, LDS subgroup %llu; begun unforced %llu\n",
+    std::fprintf(stderr, "[draw-passes] (10 s): continued %llu, begun %llu; forced: capture %llu, reads target %llu, GPU indirect with argument rewrite %llu, GPU indirect without rewrite %llu, mesh indirect %llu, LDS subgroup %llu; begun unforced %llu; rewrites with the previous rewrite's key %llu, with a new key %llu\n",
                  static_cast<unsigned long long>(c[PassContinued]), static_cast<unsigned long long>(c[PassBegun]), static_cast<unsigned long long>(c[ForcedCapture]),
                  static_cast<unsigned long long>(c[ForcedReadsTarget]), static_cast<unsigned long long>(c[ForcedIndirectRewrite]), static_cast<unsigned long long>(c[ForcedIndirectPlain]),
-                 static_cast<unsigned long long>(c[ForcedMeshIndirect]), static_cast<unsigned long long>(c[ForcedLds]), static_cast<unsigned long long>(c[BegunUnforced]));
+                 static_cast<unsigned long long>(c[ForcedMeshIndirect]), static_cast<unsigned long long>(c[ForcedLds]), static_cast<unsigned long long>(c[BegunUnforced]),
+                 static_cast<unsigned long long>(c[RewriteSameKey]), static_cast<unsigned long long>(c[RewriteNewKey]));
 }
 
 void countDrawKind(const std::array<double, PhaseCount>& us) {
@@ -2312,6 +2313,13 @@ void recordDraw(const Context& context, const State& state, const Pm4::DrawParam
     // ALL_COMMANDS -> DRAW_INDIRECT): the pass-start barrier does not cover indirect-command reads. Per recording thread.
     thread_local bool passHasIndirectBarrier = false;
     const bool forcedByIndirect = gpuIndirect && (!forceOnlyRewrite || argumentsRewritten || !passHasIndirectBarrier);
+    if (argumentsRewritten && std::getenv("APS5_PROFILE_DRAW") != nullptr) {
+        // B97 probe: would one keyed scratch serve this draw (same argument import, record layout and constants as the last)?
+        thread_local std::array<std::uint64_t, 5> lastKey{};
+        const std::array<std::uint64_t, 5> key{reinterpret_cast<std::uint64_t>(record.indirect->argumentImport->buffer), args->stride, args->recordBytes, args->vertexConstant, args->instanceConstant};
+        passCounts[key == lastKey ? RewriteSameKey : RewriteNewKey].fetch_add(1, std::memory_order_relaxed);
+        lastKey = key;
+    }
     if (gpuIndirect && !forcedByIndirect) {
         passReads.emplace_back(args->arguments, args->arguments + args->RangeBytes());
         if (args->countIndirect) passReads.emplace_back(args->countAddress, args->countAddress + 4);
