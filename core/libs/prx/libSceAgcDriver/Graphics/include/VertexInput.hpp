@@ -339,6 +339,30 @@ inline std::optional<std::uint32_t> ZeroFetchVertex(std::span<const ShaderRecomp
     return zeroFrom;
 }
 
+// True when some attribute reads per vertex (a strided, non-null, vertex-indexed fetch). Without one no Vulkan
+// attribute reads zeros past its records, and the shader may fetch by the vertex index itself (runtime fetch).
+inline bool PerVertexFetch(std::span<const ShaderRecompiler::VertexAttribute> attributes) {
+    for (const auto& attribute : attributes) {
+        const auto stride = (attribute.resource.fields[1] >> 16u) & 0x3fffu;
+        if (!NullVertexDescriptor(attribute) && attribute.fetchIndex == 0 && stride != 0) return true;
+    }
+    return false;
+}
+
+// The first vertex the zero-fetch clamp may move indices to. needsAttribute (APS5_ZERO_FETCH_NEEDS_ATTRIBUTE, B99
+// 10-24): no clamp without a per-vertex attribute, since moving the index then changes what a runtime-fetch shader reads.
+inline std::optional<std::uint32_t> ZeroFetchClampVertex(std::span<const ShaderRecompiler::VertexAttribute> attributes, bool needsAttribute) {
+    if (needsAttribute && !PerVertexFetch(attributes)) return std::nullopt;
+    return ZeroFetchVertex(attributes);
+}
+
+// Whether an indexed draw scans its in-place indices for the highest one (APS5_INDIRECT_SKIP_INDEX_SCAN): an indirect
+// draw binds its vertex inputs' whole extent, so it needs the highest index only for the zero-fetch clamp and a mesh
+// restart table.
+inline bool IndexScanNeeded(bool skipIndirectScan, bool indirect, bool imported, bool meshRestart, bool zeroFetchClamp) {
+    return !(skipIndirectScan && indirect && imported && !meshRestart && !zeroFetchClamp);
+}
+
 inline std::optional<std::uint32_t> ClampDrawIndices(std::span<std::byte> indices, std::uint32_t indexSize, bool skipRestart, std::uint32_t limit) {
     Require(indexSize == 2 || indexSize == 4, "unsupported index size");
     const auto restartIndex = indexSize == 2 ? 0xffffu : 0xffffffffu;

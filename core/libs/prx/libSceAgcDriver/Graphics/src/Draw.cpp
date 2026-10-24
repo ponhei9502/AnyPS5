@@ -1259,7 +1259,7 @@ namespace {
 // B94 probe (10-24): why draw inputs are copied instead of read in place, and whether the copy is reused. One line per 10 s under
 // APS5_PROFILE_DRAW: "[draw-inputs] (10 s): in place N; refused: disabled N, pending write N, label/store N, copied writer N, draw writer N,
 // no import N, misaligned N; copies: reused N, unwatched (generation 0) N, new N (X MiB)".
-enum DrawInputCount : std::size_t { InPlaceHit, RefuseDisabled, RefusePendingWrite, RefuseLabelOrStore, RefuseCopiedWriter, RefuseDrawWriter, RefuseNoImport, RefuseMisaligned, CopyReused, CopyUnwatched, CopyNew, CopyNewBytes, CopyZeroPadded, CopyZeroPaddedBytes, IndexSmall, IndexReused, IndexScanUnwatched, IndexScanMiss, IndexScanBytes, FlushPendingNs, IndexScanSkipped, DrawInputCounts };
+enum DrawInputCount : std::size_t { InPlaceHit, RefuseDisabled, RefusePendingWrite, RefuseLabelOrStore, RefuseCopiedWriter, RefuseDrawWriter, RefuseNoImport, RefuseMisaligned, CopyReused, CopyUnwatched, CopyNew, CopyNewBytes, CopyZeroPadded, CopyZeroPaddedBytes, IndexSmall, IndexReused, IndexScanUnwatched, IndexScanMiss, IndexScanBytes, FlushPendingNs, IndexScanSkipped, NoAttributePast64Ki, ZeroFetchClamp, ZeroFetchClampNoAttribute, ZeroFetchClampBytes, DrawInputCounts };
 std::array<std::atomic<std::uint64_t>, DrawInputCounts> drawInputCounts{};
 std::atomic<std::int64_t> drawInputsReportedAt{0};
 
@@ -1273,14 +1273,15 @@ void countDrawInput(DrawInputCount what, std::uint64_t amount = 1) {
     if (now - last < 10 || !drawInputsReportedAt.compare_exchange_strong(last, now, std::memory_order_relaxed)) return;
     std::array<std::uint64_t, DrawInputCounts> c{};
     for (std::size_t i = 0; i < DrawInputCounts; ++i) c[i] = drawInputCounts[i].exchange(0, std::memory_order_relaxed);
-    std::fprintf(stderr, "[draw-inputs] (10 s): in place %llu; refused: disabled %llu, pending write %llu, label/store %llu, copied writer %llu, draw writer %llu, no import %llu, misaligned %llu; copies: reused %llu, unwatched (generation 0) %llu, new %llu (%.1f MiB), zero-padded %llu (%.1f MiB); in-place index ranges: small %llu, reused %llu, scanned unwatched %llu, scanned miss %llu (%.1f MiB scanned), skipped (indirect) %llu; vertex FlushPending %.1f ms\n",
+    std::fprintf(stderr, "[draw-inputs] (10 s): in place %llu; refused: disabled %llu, pending write %llu, label/store %llu, copied writer %llu, draw writer %llu, no import %llu, misaligned %llu; copies: reused %llu, unwatched (generation 0) %llu, new %llu (%.1f MiB), zero-padded %llu (%.1f MiB); in-place index ranges: small %llu, reused %llu, scanned unwatched %llu, scanned miss %llu (%.1f MiB scanned), skipped (indirect) %llu; vertex FlushPending %.1f ms; no-attribute draws past 64Ki %llu; zero-fetch clamps %llu, without attribute %llu (%.1f MiB copied)\n",
                  static_cast<unsigned long long>(c[InPlaceHit]), static_cast<unsigned long long>(c[RefuseDisabled]), static_cast<unsigned long long>(c[RefusePendingWrite]),
                  static_cast<unsigned long long>(c[RefuseLabelOrStore]), static_cast<unsigned long long>(c[RefuseCopiedWriter]), static_cast<unsigned long long>(c[RefuseDrawWriter]),
                  static_cast<unsigned long long>(c[RefuseNoImport]), static_cast<unsigned long long>(c[RefuseMisaligned]), static_cast<unsigned long long>(c[CopyReused]),
                  static_cast<unsigned long long>(c[CopyUnwatched]), static_cast<unsigned long long>(c[CopyNew]), static_cast<double>(c[CopyNewBytes]) / (1024.0 * 1024.0),
                  static_cast<unsigned long long>(c[CopyZeroPadded]), static_cast<double>(c[CopyZeroPaddedBytes]) / (1024.0 * 1024.0),
                  static_cast<unsigned long long>(c[IndexSmall]), static_cast<unsigned long long>(c[IndexReused]), static_cast<unsigned long long>(c[IndexScanUnwatched]),
-                 static_cast<unsigned long long>(c[IndexScanMiss]), static_cast<double>(c[IndexScanBytes]) / (1024.0 * 1024.0), static_cast<unsigned long long>(c[IndexScanSkipped]), static_cast<double>(c[FlushPendingNs]) / 1e6);
+                 static_cast<unsigned long long>(c[IndexScanMiss]), static_cast<double>(c[IndexScanBytes]) / (1024.0 * 1024.0), static_cast<unsigned long long>(c[IndexScanSkipped]), static_cast<double>(c[FlushPendingNs]) / 1e6,
+                 static_cast<unsigned long long>(c[NoAttributePast64Ki]), static_cast<unsigned long long>(c[ZeroFetchClamp]), static_cast<unsigned long long>(c[ZeroFetchClampNoAttribute]), static_cast<double>(c[ZeroFetchClampBytes]) / (1024.0 * 1024.0));
 }
 
 }
@@ -1594,8 +1595,14 @@ DrawInputs prepareDrawInputs(const Context& context, const State& state, const P
         // range of a DRAW_INDEX_INDIRECT_MULTI is the declared INDEX_BUFFER_SIZE, ~12 MiB per scan); an all-restart
         // draw then draws nothing on the GPU instead of being skipped.
         static const bool skipIndirectScan = std::getenv("APS5_INDIRECT_SKIP_INDEX_SCAN") != nullptr;
+        // B99 (10-24, APS5_ZERO_FETCH_NEEDS_ATTRIBUTE): ZeroFetchVertex reads an empty attribute list (runtime vertex
+        // fetch) as "every vertex past 0 reads zeros", so indices >= 64Ki were all moved to 0 and the draw collapsed
+        // (tests/execution/IndirectSkipIndexScan.cpp). With the switch the clamp needs a per-vertex attribute.
+        static const bool zeroFetchNeedsAttribute = std::getenv("APS5_ZERO_FETCH_NEEDS_ATTRIBUTE") != nullptr;
+        const auto& vertexAttributes = shaders.front().program->vertexAttributes;
+        const auto zeroFetchFrom = state.stages.mesh ? std::nullopt : ZeroFetchClampVertex(vertexAttributes, zeroFetchNeedsAttribute);
         const bool meshRestart = skipRestart && state.stages.mesh && state.stages.mesh->inputPrimitive == 6;
-        const bool scanNeeded = !(skipIndirectScan && draw.indirect && import != nullptr && !meshRestart && (state.stages.mesh || !ZeroFetchVertex(shaders.front().program->vertexAttributes)));
+        const bool scanNeeded = IndexScanNeeded(skipIndirectScan, draw.indirect.has_value(), import != nullptr, meshRestart, zeroFetchFrom.has_value());
         if (import != nullptr && !scanNeeded) {
             highest = 0u;
             countDrawInput(IndexScanSkipped);
@@ -1614,9 +1621,13 @@ DrawInputs prepareDrawInputs(const Context& context, const State& state, const P
             return inputs;
         }
         constexpr std::uint32_t ZeroFetchSlack = 0x10000u;
-        if (const auto zeroFrom = state.stages.mesh ? std::nullopt : ZeroFetchVertex(shaders.front().program->vertexAttributes)) {
+        const bool noAttribute = !state.stages.mesh && !PerVertexFetch(vertexAttributes);
+        if (noAttribute && *highest >= ZeroFetchSlack) countDrawInput(NoAttributePast64Ki);
+        if (const auto zeroFrom = zeroFetchFrom) {
             const auto limit = *zeroFrom > draw.firstVertex ? *zeroFrom - draw.firstVertex : 0u;
             if (*highest >= limit && *highest - limit >= ZeroFetchSlack) {
+                countDrawInput(noAttribute ? ZeroFetchClampNoAttribute : ZeroFetchClamp);
+                countDrawInput(ZeroFetchClampBytes, indexBytes);
                 GuestMemory::FlushGpuWrites(draw.indexAddress, static_cast<std::size_t>(indexBytes));
                 auto clamped = std::make_shared<Buffer>(context, static_cast<std::size_t>(indexBytes), VK_BUFFER_USAGE_INDEX_BUFFER_BIT);
                 const auto bytes = clamped->Bytes().first(static_cast<std::size_t>(indexBytes));

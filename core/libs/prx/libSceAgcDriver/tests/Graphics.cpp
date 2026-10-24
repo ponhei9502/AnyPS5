@@ -10293,6 +10293,19 @@ void validationTests() {
             Require(AgcDriver::Graphics::ClampDrawIndices(std::as_writable_bytes(std::span(indices)), 4, false, 9u) == 9u && indices == std::array<std::uint32_t, 4>{9u, 2u, 9u, 9u}, "clamping without restart kept a 0xffffffff index");
             std::array<std::uint16_t, 2> narrow{0xffffu, 1u};
             Require(AgcDriver::Graphics::ClampDrawIndices(std::as_writable_bytes(std::span(narrow)), 2, false, 4u) == 4u && narrow[0] == 4u && narrow[1] == 1u, "clamping 16-bit indices failed");
+            // B99 (10-24): the clamp needs a per-vertex attribute under APS5_ZERO_FETCH_NEEDS_ATTRIBUTE; the index scan
+            // of an indirect draw is skipped (APS5_INDIRECT_SKIP_INDEX_SCAN) only when no clamp and no restart table need it.
+            const std::span<const ShaderRecompiler::VertexAttribute> none;
+            const std::array perInstance{instanced, constant};
+            Require(AgcDriver::Graphics::PerVertexFetch(attributes) && !AgcDriver::Graphics::PerVertexFetch(none) && !AgcDriver::Graphics::PerVertexFetch(perInstance), "per-vertex fetch detection is wrong");
+            Require(AgcDriver::Graphics::ZeroFetchClampVertex(none, false) == 0u, "without the switch an empty attribute list no longer clamps at vertex 0");
+            Require(!AgcDriver::Graphics::ZeroFetchClampVertex(none, true).has_value() && !AgcDriver::Graphics::ZeroFetchClampVertex(perInstance, true).has_value(), "a draw with no per-vertex attribute was clamped under APS5_ZERO_FETCH_NEEDS_ATTRIBUTE");
+            Require(AgcDriver::Graphics::ZeroFetchClampVertex(attributes, true) == 9u, "a per-vertex zero-fetch attribute lost its clamp under APS5_ZERO_FETCH_NEEDS_ATTRIBUTE");
+            using AgcDriver::Graphics::IndexScanNeeded;
+            Require(!IndexScanNeeded(true, true, true, false, false), "an in-place indirect draw with no clamp and no restart table was scanned");
+            Require(IndexScanNeeded(true, true, true, false, true), "an indirect draw with a zero-fetch attribute skipped the scan its clamp needs");
+            Require(IndexScanNeeded(true, true, true, true, false), "an indirect draw with a mesh restart table skipped the scan");
+            Require(IndexScanNeeded(false, true, true, false, false) && IndexScanNeeded(true, false, true, false, false) && IndexScanNeeded(true, true, false, false, false), "the scan was skipped without the switch, for a direct draw or for copied indices");
         }
         attribute.fetchIndex = 1;
         Require(AgcDriver::Graphics::VertexBufferReadOffset(attribute, 2, 7) == 224, "instance range includes records before the first instance");
