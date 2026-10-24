@@ -23,6 +23,8 @@
 #else
 #include <fcntl.h>
 #include <sys/file.h>
+#include <sys/mman.h>
+#include <sys/stat.h>
 #include <unistd.h>
 #endif
 
@@ -49,6 +51,34 @@ constexpr std::uint32_t ModuleRecord = 1u;
 constexpr std::uint32_t GraphicsRecord = 2u;
 constexpr std::uint32_t ComputeRecord = 3u;
 constexpr std::uint64_t RecordAlignment = 8u;
+
+#ifndef _WIN32
+struct MappedJournal {
+    const std::byte* data = nullptr;
+    std::size_t size = 0;
+    ~MappedJournal() {
+        if (data != nullptr && data != MAP_FAILED) munmap(const_cast<std::byte*>(data), size);
+    }
+};
+
+std::shared_ptr<const MappedJournal> mapJournal(const std::filesystem::path& path) {
+    const int fd = ::open(path.string().c_str(), O_RDONLY | O_CLOEXEC);
+    if (fd < 0) return nullptr;
+    struct stat info {};
+    if (::fstat(fd, &info) != 0 || info.st_size <= 0) {
+        ::close(fd);
+        return nullptr;
+    }
+    const auto size = static_cast<std::size_t>(info.st_size);
+    void* mapping = ::mmap(nullptr, size, PROT_READ, MAP_PRIVATE, fd, 0);
+    ::close(fd);
+    if (mapping == MAP_FAILED) return nullptr;
+    auto journal = std::make_shared<MappedJournal>();
+    journal->data = static_cast<const std::byte*>(mapping);
+    journal->size = size;
+    return journal;
+}
+#endif
 
 struct FileHeader {
     std::uint32_t magic;
@@ -469,13 +499,28 @@ public:
         LoadedJournal loaded;
         if (!Enabled() || !bound.load(std::memory_order_acquire)) return loaded;
         const auto started = std::chrono::steady_clock::now();
+        static const bool mmapJournal = std::getenv("APS5_PIPELINE_JOURNAL_MMAP") != nullptr;
         auto file = std::make_shared<std::vector<std::byte>>();
         bool read = false;
+        bool mapped = false;
+#ifndef _WIN32
+        std::shared_ptr<const MappedJournal> mapping;
+#endif
         {
             FileLock fileLock(lockPath);
-            read = ShaderRecompiler::ReadWholeFile(path, *file);
+#ifndef _WIN32
+            if (mmapJournal) {
+                mapping = mapJournal(path);
+                if (mapping) {
+                    parse(std::span<const std::byte>(mapping->data, mapping->size), mapping, loaded, true);
+                    read = true;
+                    mapped = true;
+                }
+            }
+#endif
+            if (!read) read = ShaderRecompiler::ReadWholeFile(path, *file);
         }
-        if (read) parse(*file, file, loaded, true);
+        if (!mapped && read) parse(std::span<const std::byte>(*file), file, loaded, true);
         const auto ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - started).count();
         {
             std::lock_guard lock(mutex);
@@ -493,7 +538,7 @@ public:
             counters.droppedRecords.store(loaded.dropped, std::memory_order_relaxed);
             loadMs.store(ms, std::memory_order_relaxed);
         }
-        if (loaded.bytes != 0 || loaded.dropped != 0) std::fprintf(stderr, "[pipeline-journal] loaded %zu pipelines and %zu modules (%.1f MiB) from %s in %.0f ms%s\n", loaded.entries.size(), loaded.modules.size(), static_cast<double>(loaded.bytes) / (1024.0 * 1024.0), path.string().c_str(), ms, !loaded.headerValid ? "; written by another build or device, starting over" : loaded.dropped != 0 ? "; the file's tail was unreadable and is dropped" : "");
+        if (loaded.bytes != 0 || loaded.dropped != 0) std::fprintf(stderr, "[pipeline-journal] loaded %zu pipelines and %zu modules (%.1f MiB) from %s in %.0f ms%s%s\n", loaded.entries.size(), loaded.modules.size(), static_cast<double>(loaded.bytes) / (1024.0 * 1024.0), path.string().c_str(), ms, !loaded.headerValid ? "; written by another build or device, starting over" : loaded.dropped != 0 ? "; the file's tail was unreadable and is dropped" : "", mapped ? " (mapped)" : "");
         return loaded;
     }
 
@@ -592,11 +637,10 @@ private:
     // Parses the file: with `loaded` set every record is decoded, otherwise only the index (the
     // module identities and record hashes) is built. Stops at the first record that does not
     // parse; the bytes before it stay valid.
-    void parse(const std::vector<std::byte>& file, const std::shared_ptr<const std::vector<std::byte>>& owner, LoadedJournal& loaded, bool decode) {
+    void parse(std::span<const std::byte> bytes, const std::shared_ptr<const void>& owner, LoadedJournal& loaded, bool decode) {
         std::uint64_t valid = 0;
         bool header = false;
         std::uint64_t dropped = 0;
-        const auto bytes = std::span<const std::byte>(file);
         if (bytes.size() >= sizeof(FileHeader)) {
             FileHeader fileHeader;
             std::memcpy(&fileHeader, bytes.data(), sizeof(fileHeader));
@@ -672,7 +716,7 @@ private:
         std::error_code error;
         const bool exists = std::filesystem::exists(path, error);
         if (exists && !ShaderRecompiler::ReadWholeFile(path, file)) return false;
-        if (exists) parse(file, nullptr, index, false);
+        if (exists) parse(std::span<const std::byte>(file), nullptr, index, false);
         std::lock_guard lock(mutex);
         indexed = true;
         validBytes = index.validBytes;
@@ -814,12 +858,25 @@ private:
             writer.Raw(header);
             prefix.resize(static_cast<std::size_t>(padded(prefix.size())));
         }
-        std::ofstream file(path, fresh ? std::ios::binary | std::ios::trunc : std::ios::binary | std::ios::app);
-        if (!file) throw std::runtime_error("cannot open the journal for writing");
-        if (!prefix.empty()) file.write(reinterpret_cast<const char*>(prefix.data()), static_cast<std::streamsize>(prefix.size()));
-        file.write(reinterpret_cast<const char*>(batch.data()), static_cast<std::streamsize>(batch.size()));
-        file.flush();
-        if (file.fail()) throw std::runtime_error("the journal write failed");
+        if (fresh) {
+            const auto temporary = path.string() + ".tmp";
+            std::ofstream file(temporary, std::ios::binary | std::ios::trunc);
+            if (!file) throw std::runtime_error("cannot open the journal for writing");
+            if (!prefix.empty()) file.write(reinterpret_cast<const char*>(prefix.data()), static_cast<std::streamsize>(prefix.size()));
+            file.write(reinterpret_cast<const char*>(batch.data()), static_cast<std::streamsize>(batch.size()));
+            file.flush();
+            if (file.fail()) throw std::runtime_error("the journal write failed");
+            file.close();
+            std::filesystem::rename(temporary, path, error);
+            if (error) throw std::runtime_error("the journal write failed");
+        } else {
+            std::ofstream file(path, std::ios::binary | std::ios::app);
+            if (!file) throw std::runtime_error("cannot open the journal for writing");
+            if (!prefix.empty()) file.write(reinterpret_cast<const char*>(prefix.data()), static_cast<std::streamsize>(prefix.size()));
+            file.write(reinterpret_cast<const char*>(batch.data()), static_cast<std::streamsize>(batch.size()));
+            file.flush();
+            if (file.fail()) throw std::runtime_error("the journal write failed");
+        }
         std::lock_guard lock(mutex);
         headerValid = true;
         validBytes = (fresh ? padded(sizeof(FileHeader)) : validBytes) + batch.size();
