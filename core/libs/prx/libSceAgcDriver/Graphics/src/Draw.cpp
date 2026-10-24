@@ -1166,6 +1166,34 @@ void reportDrawEnd(const State& state, const DrawTimer& timer, const ShaderResou
 
 }
 
+namespace {
+
+// B94 probe (10-24): why draw inputs are copied instead of read in place, and whether the copy is reused. One line per 10 s under
+// APS5_PROFILE_DRAW: "[draw-inputs] (10 s): in place N; refused: disabled N, pending write N, label/store N, copied writer N, draw writer N,
+// no import N, misaligned N; copies: reused N, unwatched (generation 0) N, new N (X MiB)".
+enum DrawInputCount : std::size_t { InPlaceHit, RefuseDisabled, RefusePendingWrite, RefuseLabelOrStore, RefuseCopiedWriter, RefuseDrawWriter, RefuseNoImport, RefuseMisaligned, CopyReused, CopyUnwatched, CopyNew, CopyNewBytes, DrawInputCounts };
+std::array<std::atomic<std::uint64_t>, DrawInputCounts> drawInputCounts{};
+std::atomic<std::int64_t> drawInputsReportedAt{0};
+
+void countDrawInput(DrawInputCount what, std::uint64_t amount = 1) {
+    static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
+    if (!profile) return;
+    drawInputCounts[what].fetch_add(amount, std::memory_order_relaxed);
+    const auto now = std::chrono::duration_cast<std::chrono::seconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+    auto last = drawInputsReportedAt.load(std::memory_order_relaxed);
+    if (last == 0) { drawInputsReportedAt.compare_exchange_strong(last, now, std::memory_order_relaxed); return; }
+    if (now - last < 10 || !drawInputsReportedAt.compare_exchange_strong(last, now, std::memory_order_relaxed)) return;
+    std::array<std::uint64_t, DrawInputCounts> c{};
+    for (std::size_t i = 0; i < DrawInputCounts; ++i) c[i] = drawInputCounts[i].exchange(0, std::memory_order_relaxed);
+    std::fprintf(stderr, "[draw-inputs] (10 s): in place %llu; refused: disabled %llu, pending write %llu, label/store %llu, copied writer %llu, draw writer %llu, no import %llu, misaligned %llu; copies: reused %llu, unwatched (generation 0) %llu, new %llu (%.1f MiB)\n",
+                 static_cast<unsigned long long>(c[InPlaceHit]), static_cast<unsigned long long>(c[RefuseDisabled]), static_cast<unsigned long long>(c[RefusePendingWrite]),
+                 static_cast<unsigned long long>(c[RefuseLabelOrStore]), static_cast<unsigned long long>(c[RefuseCopiedWriter]), static_cast<unsigned long long>(c[RefuseDrawWriter]),
+                 static_cast<unsigned long long>(c[RefuseNoImport]), static_cast<unsigned long long>(c[RefuseMisaligned]), static_cast<unsigned long long>(c[CopyReused]),
+                 static_cast<unsigned long long>(c[CopyUnwatched]), static_cast<unsigned long long>(c[CopyNew]), static_cast<double>(c[CopyNewBytes]) / (1024.0 * 1024.0));
+}
+
+}
+
 DrawInputCopy CopyDrawInput(const Context& context, Recorder* recorder, std::uint64_t address, std::size_t bytes, std::size_t alignment, Recorder::SnapshotUse use) {
     Require(use != Recorder::SnapshotUse::Storage, "a draw input is a vertex or index buffer");
     DrawInputCopy copy;
@@ -1176,11 +1204,15 @@ DrawInputCopy CopyDrawInput(const Context& context, Recorder* recorder, std::uin
         if (copy.generation != 0) copy.buffer = recorder->ReusableDrawSnapshot(address, bytes, use, &copy.derived);
         if (copy.buffer != nullptr) {
             copy.reused = true;
+            countDrawInput(CopyReused);
             return copy;
         }
+        if (copy.generation == 0) countDrawInput(CopyUnwatched);
     }
     copy.buffer = std::make_shared<Buffer>(context, bytes, use == Recorder::SnapshotUse::Vertex ? VK_BUFFER_USAGE_VERTEX_BUFFER_BIT : VK_BUFFER_USAGE_INDEX_BUFFER_BIT);
     GuestMemory::Read(address, copy.buffer->Bytes(), alignment);
+    countDrawInput(CopyNew);
+    countDrawInput(CopyNewBytes, bytes);
     return copy;
 }
 
@@ -1208,24 +1240,29 @@ void KeepDrawInput(Recorder* recorder, std::uint64_t address, const DrawInputCop
 
 const HostImport* InPlaceDrawInput(const Context& context, std::uint64_t address, std::size_t bytes, std::size_t alignment, bool* behindGpuWrite) {
     auto* recorder = context.recorder;
-    if (recorder == nullptr || bytes == 0 || !context.drawInputsInPlace) return nullptr;
+    if (recorder == nullptr || bytes == 0 || !context.drawInputsInPlace) {
+        if (recorder != nullptr && bytes != 0) countDrawInput(RefuseDisabled);
+        return nullptr;
+    }
     bool behind = false;
     if (behindGpuWrite == nullptr) {
         GuestMemory::FlushGpuWrites(address, bytes);
-        if (recorder->PendingWriteOverlaps(address, bytes)) return nullptr;
+        if (recorder->PendingWriteOverlaps(address, bytes)) { countDrawInput(RefusePendingWrite); return nullptr; }
     } else {
         StorageTexture::FlushPending(address, bytes, nullptr, "in-place vertex input");
         behind = recorder->PendingWriteOverlaps(address, bytes);
     }
-    if (recorder->PendingLabelIn(address, bytes) || recorder->QueuedStoreOverlaps(address, bytes)) return nullptr;
+    if (recorder->PendingLabelIn(address, bytes) || recorder->QueuedStoreOverlaps(address, bytes)) { countDrawInput(RefuseLabelOrStore); return nullptr; }
     const auto overlaps = [&](const auto& writer) { return writer->WritesOverlap(address, bytes); };
-    if (context.copiedWriters != nullptr && std::any_of(context.copiedWriters->begin(), context.copiedWriters->end(), overlaps)) return nullptr;
+    if (context.copiedWriters != nullptr && std::any_of(context.copiedWriters->begin(), context.copiedWriters->end(), overlaps)) { countDrawInput(RefuseCopiedWriter); return nullptr; }
     const auto drawWriters = DrawCopiedWriters();
-    if (std::any_of(drawWriters->begin(), drawWriters->end(), overlaps)) return nullptr;
+    if (std::any_of(drawWriters->begin(), drawWriters->end(), overlaps)) { countDrawInput(RefuseDrawWriter); return nullptr; }
     const auto* import = HostImportFor(context, address, bytes);
-    if (import == nullptr || HostImportOffset(*import, address) % alignment != 0) return nullptr;
+    if (import == nullptr) { countDrawInput(RefuseNoImport); return nullptr; }
+    if (HostImportOffset(*import, address) % alignment != 0) { countDrawInput(RefuseMisaligned); return nullptr; }
     recorder->NotePendingRead(address, bytes, Recorder::ReadKind::DrawInput);
     if (behindGpuWrite != nullptr && behind) *behindGpuWrite = true;
+    countDrawInput(InPlaceHit);
     return import;
 }
 
