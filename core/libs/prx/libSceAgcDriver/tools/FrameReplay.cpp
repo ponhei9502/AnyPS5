@@ -208,6 +208,14 @@ Skipped restoreMemory(const FrameCaptureReader& reader) {
         for (const auto& chunk : reader.Chunks()) {
             if (chunk.kind != FrameMemoryKind::Range || chunk.rangeKind == FrameRangeKind::Host) continue;
             const bool gpu = (chunk.access & FrameRangeAccess::Gpu) != 0;
+#ifndef _WIN32
+            // The AGC driver's own 2 MiB block (Lifecycle.cpp MapDriverMemory, 0xfe0000000 in the system-reserved range) is mapped
+            // with mmap outside the guest arena, so the arena refuses it here; this replay's driver maps and fills it itself.
+            if (chunk.address == 0xfe0000000ull + GuestArena::GuestAddressOffset && !committedWritable(chunk.address, chunk.bytes)) {
+                skipped.Add(chunk);
+                continue;
+            }
+#endif
             if (committedWritable(chunk.address, chunk.bytes)) {
                 if (!gpu) skipped.Add(chunk);
                 else std::memset(reinterpret_cast<void*>(static_cast<std::uintptr_t>(chunk.address)), 0, static_cast<std::size_t>(chunk.bytes));
