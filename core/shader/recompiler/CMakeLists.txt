@@ -336,6 +336,7 @@ function(add_shader_recompiler target runtimeTarget)
             "-DRECOMPILER_DIR=${CMAKE_CURRENT_FUNCTION_LIST_DIR}"
             "-DGIT=${GIT_EXECUTABLE}"
             "-DEXTRA=${shaderCacheExtra}"
+            "-DPIN=${APS5_SHADER_SOURCE_VERSION_PIN}"
             "-DOUTPUT=${shaderCacheVersionSource}"
             -P "${CMAKE_CURRENT_FUNCTION_LIST_DIR}/ShaderCacheVersion.cmake"
             DEPENDS ${shaderCacheRecompilerSources} ${shaderCacheGuardSources} ${shaderCacheSubmoduleStamps} "${shaderCacheListFile}" "${CMAKE_CURRENT_FUNCTION_LIST_DIR}/ShaderCacheVersion.cmake"

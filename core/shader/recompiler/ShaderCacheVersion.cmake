@@ -134,6 +134,16 @@ endif()
 
 string(SHA256 version "${manifest}")
 string(SUBSTRING "${version}" 0 16 version)
+# APS5_SHADER_SOURCE_VERSION_PIN (build-only, 10-25, Lead rule): reuse a warm shader cache across a recompiler diff that is reviewed
+# as output-neutral (memoisation, eviction, counters; no emit or key path). The review record names the diff; drop the pin in any
+# build that changes anything else under core/shader.
+if(PIN)
+    if(NOT PIN MATCHES "^[0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]$")
+        message(FATAL_ERROR "APS5_SHADER_SOURCE_VERSION_PIN must be 16 lowercase hex digits, got '${PIN}'")
+    endif()
+    message(WARNING "Shader disk cache SourceVersion PINNED to ${PIN} (computed ${version}); valid only for a reviewed output-neutral diff")
+    set(version "${PIN}")
+endif()
 list(REMOVE_DUPLICATES switches)
 list(SORT switches)
 list(JOIN switches ",\n    " switchList)
