@@ -1144,6 +1144,57 @@ struct DrawTimer {
     }
 };
 
+// B96 probe (10-24): the draw phases split by packet kind (direct, DRAW_INDIRECT 0x24, DRAW_INDEX_INDIRECT 0x25,
+// DRAW_INDEX_INDIRECT_MULTI 0x38, other indirect). Graphics::Draw / DrawWithRecipe set the thread's kind; one line per 10 s.
+thread_local std::uint32_t drawKindOpcode = 0;
+constexpr std::size_t DrawKinds = 5;
+constexpr std::array<const char*, DrawKinds> PacketKindNames{"direct", "DRAW_INDIRECT", "DRAW_INDEX_INDIRECT", "DRAW_INDEX_INDIRECT_MULTI", "other indirect"};
+std::array<std::atomic<std::uint64_t>, DrawKinds> drawKindCounts{};
+std::array<std::array<std::atomic<std::uint64_t>, PhaseCount>, DrawKinds> drawKindNs{};
+std::atomic<std::int64_t> drawKindsReportedAt{0};
+
+std::size_t drawKindIndex(std::uint32_t opcode) {
+    switch (opcode) {
+    case 0: return 0;
+    case 0x24: return 1;
+    case 0x25: return 2;
+    case 0x38: return 3;
+    default: return 4;
+    }
+}
+
+void countDrawKind(const std::array<double, PhaseCount>& us) {
+    const auto kind = drawKindIndex(drawKindOpcode);
+    drawKindCounts[kind].fetch_add(1, std::memory_order_relaxed);
+    for (std::size_t i = 0; i < PhaseCount; ++i) {
+        if (us[i] > 0) drawKindNs[kind][i].fetch_add(static_cast<std::uint64_t>(us[i] * 1000.0), std::memory_order_relaxed);
+    }
+    const auto now = std::chrono::duration_cast<std::chrono::seconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+    auto last = drawKindsReportedAt.load(std::memory_order_relaxed);
+    if (last == 0) { drawKindsReportedAt.compare_exchange_strong(last, now, std::memory_order_relaxed); return; }
+    if (now - last < 10 || !drawKindsReportedAt.compare_exchange_strong(last, now, std::memory_order_relaxed)) return;
+    std::string text = "[draw-kinds] (10 s):";
+    for (std::size_t k = 0; k < DrawKinds; ++k) {
+        const auto count = drawKindCounts[k].exchange(0, std::memory_order_relaxed);
+        std::array<std::uint64_t, PhaseCount> ns{};
+        std::uint64_t total = 0;
+        for (std::size_t i = 0; i < PhaseCount; ++i) total += ns[i] = drawKindNs[k][i].exchange(0, std::memory_order_relaxed);
+        if (count == 0) continue;
+        char part[96];
+        std::snprintf(part, sizeof(part), " %s %llu draws %.0f ms (avg %.1f us)", PacketKindNames[k], static_cast<unsigned long long>(count), total / 1e6, total / 1e3 / count);
+        text += part;
+        std::array<std::size_t, PhaseCount> order{};
+        for (std::size_t i = 0; i < PhaseCount; ++i) order[i] = i;
+        std::partial_sort(order.begin(), order.begin() + 4, order.end(), [&](std::size_t a, std::size_t b) { return ns[a] > ns[b]; });
+        for (std::size_t j = 0; j < 4 && ns[order[j]] != 0; ++j) {
+            std::snprintf(part, sizeof(part), "%s%s %.0f", j == 0 ? " [" : ", ", DrawPhaseNames[order[j]], ns[order[j]] / 1e6);
+            text += part;
+        }
+        text += " ms];";
+    }
+    std::fprintf(stderr, "%s\n", text.c_str());
+}
+
 // One line per draw with the phases that took time (APS5_TRACE_DRAWS), and the 10 s totals.
 // `waitedBefore` is the thread's GPU waits at the draw's start and `ownWaitedMs` the draw's own
 // syncs (see DrawOutcome::hookWaitUs).
@@ -1161,6 +1212,7 @@ void reportDrawEnd(const State& state, const DrawTimer& timer, const ShaderResou
         }
         std::fprintf(stderr, "%s\n", line);
     }
+    countDrawKind(timer.us);
     reportDraw(timer.us, built, outcome);
 }
 
@@ -1171,7 +1223,7 @@ namespace {
 // B94 probe (10-24): why draw inputs are copied instead of read in place, and whether the copy is reused. One line per 10 s under
 // APS5_PROFILE_DRAW: "[draw-inputs] (10 s): in place N; refused: disabled N, pending write N, label/store N, copied writer N, draw writer N,
 // no import N, misaligned N; copies: reused N, unwatched (generation 0) N, new N (X MiB)".
-enum DrawInputCount : std::size_t { InPlaceHit, RefuseDisabled, RefusePendingWrite, RefuseLabelOrStore, RefuseCopiedWriter, RefuseDrawWriter, RefuseNoImport, RefuseMisaligned, CopyReused, CopyUnwatched, CopyNew, CopyNewBytes, DrawInputCounts };
+enum DrawInputCount : std::size_t { InPlaceHit, RefuseDisabled, RefusePendingWrite, RefuseLabelOrStore, RefuseCopiedWriter, RefuseDrawWriter, RefuseNoImport, RefuseMisaligned, CopyReused, CopyUnwatched, CopyNew, CopyNewBytes, CopyZeroPadded, CopyZeroPaddedBytes, DrawInputCounts };
 std::array<std::atomic<std::uint64_t>, DrawInputCounts> drawInputCounts{};
 std::atomic<std::int64_t> drawInputsReportedAt{0};
 
@@ -1185,11 +1237,12 @@ void countDrawInput(DrawInputCount what, std::uint64_t amount = 1) {
     if (now - last < 10 || !drawInputsReportedAt.compare_exchange_strong(last, now, std::memory_order_relaxed)) return;
     std::array<std::uint64_t, DrawInputCounts> c{};
     for (std::size_t i = 0; i < DrawInputCounts; ++i) c[i] = drawInputCounts[i].exchange(0, std::memory_order_relaxed);
-    std::fprintf(stderr, "[draw-inputs] (10 s): in place %llu; refused: disabled %llu, pending write %llu, label/store %llu, copied writer %llu, draw writer %llu, no import %llu, misaligned %llu; copies: reused %llu, unwatched (generation 0) %llu, new %llu (%.1f MiB)\n",
+    std::fprintf(stderr, "[draw-inputs] (10 s): in place %llu; refused: disabled %llu, pending write %llu, label/store %llu, copied writer %llu, draw writer %llu, no import %llu, misaligned %llu; copies: reused %llu, unwatched (generation 0) %llu, new %llu (%.1f MiB), zero-padded %llu (%.1f MiB)\n",
                  static_cast<unsigned long long>(c[InPlaceHit]), static_cast<unsigned long long>(c[RefuseDisabled]), static_cast<unsigned long long>(c[RefusePendingWrite]),
                  static_cast<unsigned long long>(c[RefuseLabelOrStore]), static_cast<unsigned long long>(c[RefuseCopiedWriter]), static_cast<unsigned long long>(c[RefuseDrawWriter]),
                  static_cast<unsigned long long>(c[RefuseNoImport]), static_cast<unsigned long long>(c[RefuseMisaligned]), static_cast<unsigned long long>(c[CopyReused]),
-                 static_cast<unsigned long long>(c[CopyUnwatched]), static_cast<unsigned long long>(c[CopyNew]), static_cast<double>(c[CopyNewBytes]) / (1024.0 * 1024.0));
+                 static_cast<unsigned long long>(c[CopyUnwatched]), static_cast<unsigned long long>(c[CopyNew]), static_cast<double>(c[CopyNewBytes]) / (1024.0 * 1024.0),
+                 static_cast<unsigned long long>(c[CopyZeroPadded]), static_cast<double>(c[CopyZeroPaddedBytes]) / (1024.0 * 1024.0));
 }
 
 }
@@ -1230,6 +1283,8 @@ DrawInputCopy CopyZeroPaddedDrawInput(const Context& context, std::uint64_t addr
     }
     GuestMemory::Read(address, span.subspan(0, readable), 1);
     std::fill(span.begin() + static_cast<std::ptrdiff_t>(readable), span.end(), std::byte{0});
+    countDrawInput(CopyZeroPadded);
+    countDrawInput(CopyZeroPaddedBytes, bytes);
     return copy;
 }
 
@@ -3207,6 +3262,7 @@ void recordPreparedDraw(const Context& context, const State& state, const Pm4::D
 
 void Draw(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, std::span<const GuestMemorySnapshot> snapshots, std::shared_ptr<const DrawRecipe>* recipeOut) {
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
+    drawKindOpcode = draw.indirect ? draw.indirect->opcode : 0u;
     PreparedDraw prepared(profile);
     prepared.recipeOut = recipeOut;
     if (prepareDraw(context, state, draw, shaders, snapshots, prepared)) recordPreparedDraw(context, state, draw, shaders, prepared);
@@ -3215,6 +3271,7 @@ void Draw(const Context& context, const State& state, const Pm4::DrawParameters&
 DrawRecipeOutcome DrawWithRecipe(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, std::span<const GuestMemorySnapshot> snapshots, const DrawRecipe& recipe) {
     if (context.recorder != nullptr) context.recorder->BoundKeptBytes();
     static_cast<void>(snapshots);
+    drawKindOpcode = draw.indirect ? draw.indirect->opcode : 0u;
     PerformanceTimer timing("Graphics.DrawWithRecipe");
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
     DrawTimer timer(profile);
