@@ -14,6 +14,7 @@
 #include <atomic>
 #include <cerrno>
 #include <chrono>
+#include <cmath>
 #include <condition_variable>
 #include <cstdio>
 #include <cstdlib>
@@ -709,6 +710,8 @@ struct Replay {
         const auto hash = [](const std::vector<std::byte>& v) { std::uint64_t h = 0xcbf29ce484222325ull; for (auto x : v) h = (h ^ static_cast<std::uint64_t>(x)) * 0x100000001b3ull; return h; };
         const auto hex = [](const std::vector<std::byte>& v) { std::string t; char c[4]; for (std::size_t i = 0; i < std::min<std::size_t>(16, v.size()); ++i) { std::snprintf(c, sizeof(c), "%02x", static_cast<unsigned>(v[i])); t += c; } return t; };
         while (file >> a >> b >> label) {
+            std::uint32_t texWidth = 0, texHeight = 0;
+            if (label.rfind("tex16:", 0) == 0) file >> texWidth >> texHeight;
             const auto address = std::strtoull(a.c_str(), nullptr, 0);
             const auto bytes = std::min<std::uint64_t>(std::strtoull(b.c_str(), nullptr, 0), 8ull << 20);
             try {
@@ -718,6 +721,36 @@ struct Replay {
                 if (label.size() > 4 && label.ends_with(".bin") && std::getenv("APS5_CUT_DUMP_DIR") != nullptr) {
                     std::ofstream out(std::filesystem::path(std::getenv("APS5_CUT_DUMP_DIR")) / label, std::ios::binary);
                     out.write(reinterpret_cast<const char*>(now.data()), static_cast<std::streamsize>(now.size()));
+                }
+                if (texWidth != 0) {   // R16G16B16A16_SFLOAT, 64 KiB swizzled blocks of 128 x 64 texels (the display-buffer layout for 8-byte texels): alpha and red histograms
+                    const auto toFloat = [](std::uint16_t h) {
+                        const std::uint32_t sign = (h >> 15) & 1u, exp = (h >> 10) & 31u, man = h & 1023u;
+                        if (exp == 0) return (sign ? -1.0f : 1.0f) * std::ldexp(static_cast<float>(man), -24);
+                        if (exp == 31) return man ? std::nanf("") : (sign ? -INFINITY : INFINITY);
+                        return (sign ? -1.0f : 1.0f) * std::ldexp(static_cast<float>(man | 1024u), static_cast<int>(exp) - 25);
+                    };
+                    const auto offset = [](std::uint32_t x, std::uint32_t y) {
+                        return ((x << 3u) & 0x0008u) ^ ((x << 4u) & 0x0460u) ^ ((x << 5u) & 0x0300u) ^ ((x << 6u) & 0x0800u) ^ ((x << 9u) & 0x8000u) ^ ((x << 10u) & 0x2000u) ^ ((y << 4u) & 0x0010u) ^ ((y << 6u) & 0x0080u) ^ ((y << 5u) & 0x0f00u) ^ ((y << 10u) & 0x5000u);
+                    };
+                    const auto perRow = (texWidth + 127u) / 128u;
+                    std::uint64_t total = 0, aOne = 0, aZero = 0, aMid = 0, aNan = 0, rNonZero = 0;
+                    double aSum = 0, rSum = 0;
+                    for (std::uint32_t y = 0; y < texHeight; ++y) {
+                        for (std::uint32_t x = 0; x < texWidth; ++x) {
+                            const std::size_t at = static_cast<std::size_t>(y / 64u * perRow + x / 128u) * 65536u + offset(x, y);
+                            if (at + 8 > now.size()) continue;
+                            std::uint16_t half[4];
+                            std::memcpy(half, now.data() + at, 8);
+                            const float alpha = toFloat(half[3]), red = toFloat(half[0]);
+                            ++total;
+                            if (std::isnan(alpha)) { ++aNan; continue; }
+                            aSum += alpha; rSum += red; rNonZero += red != 0.0f;
+                            if (alpha >= 1.0f) ++aOne; else if (alpha == 0.0f) ++aZero; else ++aMid;
+                        }
+                    }
+                    std::fprintf(stderr, "[dump] %s %ux%u alpha histogram: %llu texels, a>=1.0 %llu (%.1f%%), a==0 %llu (%.1f%%), in between %llu (%.1f%%), NaN %llu, mean alpha %.4f, red nonzero %llu, mean red %.4f\n", label.c_str(), texWidth, texHeight, static_cast<unsigned long long>(total), static_cast<unsigned long long>(aOne),
+                                 100.0 * static_cast<double>(aOne) / static_cast<double>(std::max<std::uint64_t>(total, 1)), static_cast<unsigned long long>(aZero), 100.0 * static_cast<double>(aZero) / static_cast<double>(std::max<std::uint64_t>(total, 1)), static_cast<unsigned long long>(aMid),
+                                 100.0 * static_cast<double>(aMid) / static_cast<double>(std::max<std::uint64_t>(total, 1)), static_cast<unsigned long long>(aNan), aSum / static_cast<double>(std::max<std::uint64_t>(total, 1)), static_cast<unsigned long long>(rNonZero), rSum / static_cast<double>(std::max<std::uint64_t>(total, 1)));
                 }
                 const auto snapshot = capturedBytes(address, bytes, false, 0);
                 const auto recorded = capturedBytes(address, bytes, true, call.ordinal);
