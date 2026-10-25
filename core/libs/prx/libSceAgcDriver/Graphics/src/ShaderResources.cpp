@@ -2076,7 +2076,12 @@ bool TableCurrent(ReusedTable& table) {
             if (TableProbeOn()) countTableProbe(TpSourceGone);
             return false;
         }
-        if (source->Version() != element.sourceVersion || source->Writes() != element.sourceWrites) {
+        // What cachedTexture checks on every use (review 20261025-B99): another image now holding pending results for the
+        // surface, and a CPU write since the image's generation (cachedTexture refreshes then; a reuse would read stale texels).
+        const auto address = element.resource.baseAddress;
+        const auto pending = StorageTexture::FindPending(address, element.guestBytes);
+        if (source->Version() != element.sourceVersion || source->Writes() != element.sourceWrites || (pending != nullptr && pending != source) ||
+            !GuestMemory::UnchangedSince(address, static_cast<std::size_t>(element.guestBytes), source->GenerationFor(address, element.guestBytes))) {
             if (TableProbeOn()) countTableProbe(TpSourceWritten);
             return false;
         }
