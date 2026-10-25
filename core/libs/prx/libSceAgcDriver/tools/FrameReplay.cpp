@@ -179,6 +179,14 @@ void traceSubmit(const FrameCall& call) {
         else if (opcode == 0x37 && i + 3 < count) { what = "WRITE_DATA"; target = address(words[i + 2], words[i + 3]); value = i + 4 < count ? words[i + 4] : 0; }
         else if (opcode == 0x49 && i + 5 < count) { what = "RELEASE_MEM"; target = address(words[i + 3], words[i + 4]); value = words[i + 5]; mask = words[i + 2] >> 29; }
         else if (opcode == 0x47 && i + 4 < count) { what = "EVENT_WRITE_EOP"; target = address(words[i + 2], words[i + 3]); value = words[i + 4]; }
+        if (opcode == 0x69 && i + 2 < count) {  // SET_CONTEXT_REG: report colour target base registers (CB_COLOR0..7_BASE = 0x318 + 15 * n)
+            const auto first = words[i + 1] & 0xffffu;
+            for (std::uint32_t k = 0; k + 2 < length && i + 2 + k < count; ++k) {
+                const auto reg = first + k;
+                if (reg >= 0x318 && reg < 0x318 + 15 * 8 && (reg - 0x318) % 15 == 0) std::fprintf(stderr, "[trace] call %llu dword %u CB_COLOR%u_BASE 0x%llx\n", static_cast<unsigned long long>(call.ordinal), i, (reg - 0x318) / 15, static_cast<unsigned long long>(words[i + 2 + k]) << 8);
+            }
+        }
+        if (opcode == 0x2d || opcode == 0x27 || opcode == 0x24 || opcode == 0x25 || opcode == 0x15 || opcode == 0x16) std::fprintf(stderr, "[trace] call %llu dword %u OP 0x%x\n", static_cast<unsigned long long>(call.ordinal), i, opcode);
         if (what != nullptr) {
             std::fprintf(stderr, "[trace] call %llu queue %u serials %llu/%llu dword %u %s addr 0x%llx value/ref 0x%llx mask/sel 0x%llx fn %u now 0x%x\n", static_cast<unsigned long long>(call.ordinal), call.queue,
                          static_cast<unsigned long long>(call.completed), static_cast<unsigned long long>(call.accepted), i, what, static_cast<unsigned long long>(target), static_cast<unsigned long long>(value),
@@ -366,6 +374,26 @@ std::pair<std::uint64_t, std::uint64_t> progress() {
     return {accepted, completed};
 }
 
+// B71d probe: APS5_REPLAY_PROBE_FILE=<file of "0xADDRESS BYTES" lines> reads those guest ranges back after every submit (once the GPU is idle)
+// and prints a line when a range's content changed: block counts of non-zero and of distinct 4 KiB blocks.
+struct ProbeTarget {
+    std::uint64_t address = 0;
+    std::uint64_t bytes = 0;
+    std::uint64_t last = 0;
+};
+std::vector<ProbeTarget>& probeTargets() {
+    static std::vector<ProbeTarget> targets = [] {
+        std::vector<ProbeTarget> list;
+        if (const char* path = std::getenv("APS5_REPLAY_PROBE_FILE")) {
+            std::ifstream file(path);
+            std::string a, b;
+            while (file >> a >> b) list.push_back({std::strtoull(a.c_str(), nullptr, 0), std::min<std::uint64_t>(std::strtoull(b.c_str(), nullptr, 0), 16ull << 20), 0});
+        }
+        return list;
+    }();
+    return targets;
+}
+
 struct Replay {
     const Options& options;
     const FrameCaptureReader& reader;
@@ -491,6 +519,7 @@ struct Replay {
             const Packet packet{reinterpret_cast<std::uint32_t*>(static_cast<std::uintptr_t>(call.address)), static_cast<std::uint32_t>(call.size), static_cast<std::uint8_t>(call.flags), {}};
             if (call.queue == 0) sceAgcDriverSubmitDcb(&packet);
             else sceAgcDriverSubmitAcb(call.queue, &packet);
+            if (!probeTargets().empty()) probeAfterSubmit(call);
             if (++submits % 25 == 0) report();
             return;
         }
@@ -593,6 +622,45 @@ struct Replay {
             std::fprintf(stderr, "[frame-replay] stall: wait at 0x%llx bytes %u function %u mask 0x%llx reference 0x%llx now 0x%llx (%s)\n", static_cast<unsigned long long>(wait.address),
                          static_cast<unsigned>(wait.bytes), static_cast<unsigned>(wait.function), static_cast<unsigned long long>(wait.mask), static_cast<unsigned long long>(wait.reference),
                          static_cast<unsigned long long>(load(wait.address, bytes)), where);
+        }
+    }
+
+    void probeAfterSubmit(const FrameCall& call) {
+        static std::mutex probeMutex;
+        std::lock_guard lock(probeMutex);
+        for (int spin = 0; spin < 2500; ++spin) {
+            const auto [accepted, completed] = progress();
+            if (accepted == completed) break;
+            std::this_thread::sleep_for(std::chrono::milliseconds(2));
+        }
+        for (auto& target : probeTargets()) {
+            auto* const pointer = reinterpret_cast<const std::byte*>(static_cast<std::uintptr_t>(target.address));
+            try {
+                GuestArena::GuestArenaPrepareHostRead_nid_no_patch(pointer, static_cast<std::size_t>(target.bytes));
+            } catch (const std::exception&) {
+                continue;
+            }
+            std::uint64_t whole = 0xcbf29ce484222325ull;
+            std::uint64_t nonzero = 0;
+            std::set<std::uint64_t> distinct;
+            const auto blocks = target.bytes / 4096;
+            for (std::uint64_t block = 0; block < blocks; ++block) {
+                std::uint64_t hash = 0xcbf29ce484222325ull;
+                bool any = false;
+                for (std::size_t at = 0; at < 4096; at += 8) {
+                    std::uint64_t word;
+                    std::memcpy(&word, pointer + block * 4096 + at, 8);
+                    any = any || word != 0;
+                    hash = (hash ^ word) * 0x100000001b3ull;
+                }
+                nonzero += any ? 1 : 0;
+                distinct.insert(hash);
+                whole = (whole ^ hash) * 0x100000001b3ull;
+            }
+            if (whole == target.last) continue;
+            target.last = whole;
+            std::fprintf(stderr, "[probe] after call %llu queue %u: target 0x%llx %llu KiB changed: %llu of %llu blocks non-zero, %zu distinct\n", static_cast<unsigned long long>(call.ordinal), call.queue, static_cast<unsigned long long>(target.address),
+                         static_cast<unsigned long long>(target.bytes / 1024), static_cast<unsigned long long>(nonzero), static_cast<unsigned long long>(blocks), distinct.size());
         }
     }
 

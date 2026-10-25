@@ -2778,6 +2778,15 @@ bool prepareDraw(const Context& context, const State& state, const Pm4::DrawPara
         auto& binding = targets[index];
         binding.color = state.colors[index];
         const auto& color = binding.color;
+        {   // B71d probe: APS5_PROBE_TARGETS=1 logs each colour target address the first time a draw renders to it (replay bisection of the picture)
+            static const bool probeTargets = std::getenv("APS5_PROBE_TARGETS") != nullptr;
+            if (probeTargets) {
+                static std::mutex probeMutex;
+                static std::set<std::uint64_t> probeSeen;
+                std::lock_guard probeLock(probeMutex);
+                if (probeSeen.insert(color.address).second) APS5_LOG_OUT("[probe] draw target 0x%llx bytes=%llu extent=%ux%u format=%d samples=%u", static_cast<unsigned long long>(color.address), static_cast<unsigned long long>(color.bytes), color.extent.width, color.extent.height, static_cast<int>(color.format), static_cast<unsigned>(color.samples));
+            }
+        }
         binding.gpuTiling = color.tileMode == ColorTileMode::RenderTarget && context.detiler != nullptr;
         if (color.samples > 1) {
             binding.multisampled = true;
