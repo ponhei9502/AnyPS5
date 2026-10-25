@@ -72,6 +72,8 @@ struct Options {
     bool synthesize = true;
     bool checkSubmits = false;
     bool dryCheck = false;
+    std::uint64_t cutCall = 0;   // B71d probe: submit only the first cutCommand draw/dispatch commands of this call, probe, then exit
+    std::uint32_t cutCommand = 0;
 };
 
 class Frames {
@@ -162,6 +164,7 @@ void checkSubmitWords(const FrameCall& call, std::atomic<std::uint64_t>& zeroSub
 }
 
 // B71d-g diagnostic (APS5_DRY_TRACE=1 with --dry-check): one stderr line per PM4 packet that waits on or writes memory.
+std::uint32_t shRegs[0x400] = {};
 void traceSubmit(const FrameCall& call) {
     const auto* words = reinterpret_cast<const std::uint32_t*>(static_cast<std::uintptr_t>(call.address));
     const auto count = static_cast<std::uint32_t>(call.size);
@@ -186,7 +189,17 @@ void traceSubmit(const FrameCall& call) {
                 if (reg >= 0x318 && reg < 0x318 + 15 * 8 && (reg - 0x318) % 15 == 0) std::fprintf(stderr, "[trace] call %llu dword %u CB_COLOR%u_BASE 0x%llx\n", static_cast<unsigned long long>(call.ordinal), i, (reg - 0x318) / 15, static_cast<unsigned long long>(words[i + 2 + k]) << 8);
             }
         }
-        if (opcode == 0x2d || opcode == 0x27 || opcode == 0x24 || opcode == 0x25 || opcode == 0x15 || opcode == 0x16) std::fprintf(stderr, "[trace] call %llu dword %u OP 0x%x\n", static_cast<unsigned long long>(call.ordinal), i, opcode);
+        if (opcode == 0x76 && i + 2 < count) {  // SET_SH_REG (offset from 0x2c00): remember the graphics/compute program registers
+            const auto first = words[i + 1] & 0xffffu;
+            for (std::uint32_t k = 0; k + 2 < length && i + 2 + k < count; ++k) if (first + k < 0x400) shRegs[first + k] = words[i + 2 + k];
+        }
+        if (opcode == 0x2d || opcode == 0x27 || opcode == 0x24 || opcode == 0x25 || opcode == 0x15 || opcode == 0x16) {
+            static std::uint32_t commandIndex = 0;
+            static std::uint64_t lastCall = 0;
+            if (lastCall != call.ordinal) { lastCall = call.ordinal; commandIndex = 0; }
+            ++commandIndex;
+            std::fprintf(stderr, "[trace] call %llu dword %u OP 0x%x command %u PS 0x%llx VS 0x%llx CS 0x%llx\n", static_cast<unsigned long long>(call.ordinal), i, opcode, commandIndex, static_cast<unsigned long long>(shRegs[0x08]) << 8 | static_cast<unsigned long long>(shRegs[0x09] & 0xff) << 40, static_cast<unsigned long long>(shRegs[0x48]) << 8 | static_cast<unsigned long long>(shRegs[0x49] & 0xff) << 40, static_cast<unsigned long long>(shRegs[0x20c]) << 8 | static_cast<unsigned long long>(shRegs[0x20d] & 0xff) << 40);
+        }
         if (what != nullptr) {
             std::fprintf(stderr, "[trace] call %llu queue %u serials %llu/%llu dword %u %s addr 0x%llx value/ref 0x%llx mask/sel 0x%llx fn %u now 0x%x\n", static_cast<unsigned long long>(call.ordinal), call.queue,
                          static_cast<unsigned long long>(call.completed), static_cast<unsigned long long>(call.accepted), i, what, static_cast<unsigned long long>(target), static_cast<unsigned long long>(value),
@@ -394,6 +407,23 @@ std::vector<ProbeTarget>& probeTargets() {
     return targets;
 }
 
+std::uint32_t commandBoundary(const FrameCall& call, std::uint32_t commands) {
+    const auto* words = reinterpret_cast<const std::uint32_t*>(static_cast<std::uintptr_t>(call.address));
+    const auto count = static_cast<std::uint32_t>(call.size);
+    std::uint32_t seen = 0;
+    for (std::uint32_t i = 0; i < count;) {
+        const auto header = words[i];
+        if ((header >> 30) != 3) { ++i; continue; }
+        const auto length = 2 + ((header >> 16) & 0x3fff);
+        i += length;
+        const auto opcode = (header >> 8) & 0xff;
+        if (opcode == 0x2d || opcode == 0x27 || opcode == 0x24 || opcode == 0x25 || opcode == 0x15 || opcode == 0x16) {
+            if (++seen == commands) return std::min(i, count);
+        }
+    }
+    return count;
+}
+
 struct Replay {
     const Options& options;
     const FrameCaptureReader& reader;
@@ -516,9 +546,17 @@ struct Replay {
             return;
         case FrameCallKind::Submit: {
             if (options.checkSubmits) checkSubmitWords(call, zeroSubmits, badHeaderSubmits);
-            const Packet packet{reinterpret_cast<std::uint32_t*>(static_cast<std::uintptr_t>(call.address)), static_cast<std::uint32_t>(call.size), static_cast<std::uint8_t>(call.flags), {}};
+            const bool cut = options.cutCall != 0 && call.ordinal == options.cutCall;
+            const auto size = cut ? commandBoundary(call, options.cutCommand) : static_cast<std::uint32_t>(call.size);
+            const Packet packet{reinterpret_cast<std::uint32_t*>(static_cast<std::uintptr_t>(call.address)), size, static_cast<std::uint8_t>(call.flags), {}};
             if (call.queue == 0) sceAgcDriverSubmitDcb(&packet);
             else sceAgcDriverSubmitAcb(call.queue, &packet);
+            if (cut) {
+                std::fprintf(stderr, "[probe] cut call %llu at command %u (dword %u of %llu)\n", static_cast<unsigned long long>(call.ordinal), options.cutCommand, size, static_cast<unsigned long long>(call.size));
+                probeAfterSubmit(call, true);
+                std::fflush(stderr);
+                std::_Exit(0);
+            }
             if (!probeTargets().empty()) probeAfterSubmit(call);
             if (++submits % 25 == 0) report();
             return;
@@ -625,10 +663,10 @@ struct Replay {
         }
     }
 
-    void probeAfterSubmit(const FrameCall& call) {
+    void probeAfterSubmit(const FrameCall& call, bool force = false) {
         static std::mutex probeMutex;
         std::lock_guard lock(probeMutex);
-        for (int spin = 0; spin < 2500; ++spin) {
+        for (int spin = 0; spin < 60000; ++spin) {
             const auto [accepted, completed] = progress();
             if (accepted == completed) break;
             std::this_thread::sleep_for(std::chrono::milliseconds(2));
@@ -657,7 +695,7 @@ struct Replay {
                 distinct.insert(hash);
                 whole = (whole ^ hash) * 0x100000001b3ull;
             }
-            if (whole == target.last) continue;
+            if (!force && whole == target.last) continue;
             target.last = whole;
             std::fprintf(stderr, "[probe] after call %llu queue %u: target 0x%llx %llu KiB changed: %llu of %llu blocks non-zero, %zu distinct\n", static_cast<unsigned long long>(call.ordinal), call.queue, static_cast<unsigned long long>(target.address),
                          static_cast<unsigned long long>(target.bytes / 1024), static_cast<unsigned long long>(nonzero), static_cast<unsigned long long>(blocks), distinct.size());
@@ -918,7 +956,7 @@ int run(const Options& options) {
                 for (const auto* chunk : found->second) {
                     if (skipped.Overlaps(*chunk)) continue;
                     restore(reader, *chunk);
-                    if (std::getenv("APS5_DRY_TRACE") != nullptr && chunk->bytes <= 256) std::fprintf(stderr, "[trace] memory call %llu group %llu delta 0x%llx+%llu\n", static_cast<unsigned long long>(call->ordinal), static_cast<unsigned long long>(chunk->group), static_cast<unsigned long long>(chunk->address), static_cast<unsigned long long>(chunk->bytes));
+                    if (std::getenv("APS5_DRY_TRACE") != nullptr) std::fprintf(stderr, "[trace] memory call %llu group %llu delta 0x%llx+%llu\n", static_cast<unsigned long long>(call->ordinal), static_cast<unsigned long long>(chunk->group), static_cast<unsigned long long>(chunk->address), static_cast<unsigned long long>(chunk->bytes));
                 }
             } else if (call->kind == FrameCallKind::Submit) {
                 if (std::getenv("APS5_DRY_TRACE") != nullptr) traceSubmit(*call);
@@ -991,6 +1029,8 @@ int main(int argc, char** argv) {
         else if (argument == "--pace-timeout-ms" && index + 1 < argc) options.paceTimeout = std::chrono::milliseconds(std::strtoll(argv[++index], nullptr, 10));
         else if (argument == "--drain-timeout-ms" && index + 1 < argc) options.drainTimeout = std::chrono::milliseconds(std::strtoll(argv[++index], nullptr, 10));
         else if (argument == "--strict") options.strict = true;
+        else if (argument == "--cut-call" && index + 1 < argc) options.cutCall = std::strtoull(argv[++index], nullptr, 10);
+        else if (argument == "--cut-command" && index + 1 < argc) options.cutCommand = static_cast<std::uint32_t>(std::strtoul(argv[++index], nullptr, 10));
         else if (argument == "--check-submits") options.checkSubmits = true;
         else if (argument == "--dry-check") { options.dryCheck = true; options.checkSubmits = true; }
         else if (argument == "--dump" && index + 1 < argc) options.dumps.push_back(parseDump(argv[++index]));
