@@ -4111,6 +4111,23 @@ void Recorder::finish(std::unique_ptr<Batch> batch, bool wait, int source, bool 
         if (FlipReadCheck()) {
             entry.reads = notedReads(*batch);
         }
+        // APS5_BATCH_CSV=<path> (B108, 10-25, Builder; default off): one line per completed batch for agent/tools/batch-gaps.py:
+        // serial, queue tag, submit and fence-seen times (steady clock ns), GPU start/end (GPU timestamp ns, another clock).
+        static FILE* const csv = [] () -> FILE* {
+            const char* path = std::getenv("APS5_BATCH_CSV");
+            if (path == nullptr || *path == 0) return nullptr;
+            FILE* file = std::fopen(path, "w");
+            if (file == nullptr) { std::fprintf(stderr, "[batch-csv] cannot open %s\n", path); return nullptr; }
+            std::setvbuf(file, nullptr, _IOFBF, 1u << 20u);
+            std::fprintf(file, "serial,queue,submit_ns,gpu_start_ns,gpu_end_ns,fence_seen_ns\n");
+            return file;
+        }();
+        if (csv != nullptr) {
+            static std::uint64_t lines = 0;
+            const auto ns = [](std::chrono::steady_clock::time_point at) { return static_cast<long long>(std::chrono::duration_cast<std::chrono::nanoseconds>(at.time_since_epoch()).count()); };
+            std::fprintf(csv, "%llu,%u,%lld,%.0f,%.0f,%lld\n", static_cast<unsigned long long>(batch->serial), batch->queue, ns(entry.submittedAt), entry.gpuStartNs, entry.gpuEndNs, ns(entry.fenceSeenAt));
+            if (++lines % 1024u == 0u) std::fflush(csv);   // a normal exit flushes the rest; a killed game loses < 1024 lines
+        }
     }
     // Completions store GPU results to guest memory; a failing one is reported, the rest still run.
     // Timed (APS5_PROFILE_DRAW) with the release of the kept objects: both run under whichever hold

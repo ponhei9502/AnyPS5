@@ -154,6 +154,7 @@ void PreparePixelFunctionLds(const Context& context, VkCommandBuffer commands, s
             pool.memory = VK_NULL_HANDLE;
             Check(allocated, "vkAllocateMemory pixel function LDS");
         }
+        CountBindProbe(4);
         Check(context.Function<PFN_vkBindBufferMemory>("vkBindBufferMemory")(context.device, pool.buffer, pool.memory, 0), "vkBindBufferMemory pixel function LDS");
         Check(context.Function<PFN_vkMapMemory>("vkMapMemory")(context.device, pool.memory, 0, 16, 0, reinterpret_cast<void**>(&pool.header)), "vkMapMemory pixel function LDS");
         pool.header[0] = 0u;

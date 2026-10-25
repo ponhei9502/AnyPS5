@@ -18,6 +18,9 @@
 
 namespace AgcDriver::Graphics {
 
+// APS5_BIND_PROBE (B108): counts vkBindBufferMemory calls per site (GuestBufferMemory.cpp); 4 = the draw LDS pool.
+void CountBindProbe(int site);
+
 void ShutdownGuestBufferWorkers();
 
 struct GuestMemorySnapshot {

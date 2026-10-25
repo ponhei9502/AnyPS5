@@ -56,6 +56,24 @@
 
 namespace AgcDriver::Graphics {
 
+// APS5_BIND_PROBE (B108, 10-25, Builder; default off): vkBindBufferMemory calls per call site, one "[bind-probe]" line per 10 s
+// (nsys saw 53k binds per second during loading). Counts calls (attempts), not bytes.
+void CountBindProbe(int site) {
+    static const bool on = std::getenv("APS5_BIND_PROBE") != nullptr;
+    if (!on || site < 0 || site >= 8) return;
+    static std::array<std::atomic<std::uint64_t>, 8> calls{};
+    static std::atomic<std::int64_t> last{0};
+    calls[static_cast<std::size_t>(site)].fetch_add(1, std::memory_order_relaxed);
+    const auto now = std::chrono::steady_clock::now().time_since_epoch().count();
+    auto seen = last.load(std::memory_order_relaxed);
+    if (seen == 0) { last.compare_exchange_strong(seen, now, std::memory_order_relaxed); return; }
+    if (now - seen < 10'000'000'000ll || !last.compare_exchange_strong(seen, now, std::memory_order_relaxed)) return;
+    std::uint64_t c[8];
+    for (std::size_t i = 0; i < 8; ++i) c[i] = calls[i].exchange(0, std::memory_order_relaxed);
+    std::fprintf(stderr, "[bind-probe] (10 s): vkBindBufferMemory calls by site: guest entry %llu, chunk %llu, settle alias %llu, copy destination %llu, draw pool %llu\n",
+                 static_cast<unsigned long long>(c[0]), static_cast<unsigned long long>(c[1]), static_cast<unsigned long long>(c[2]), static_cast<unsigned long long>(c[3]), static_cast<unsigned long long>(c[4]));
+}
+
 // Image mirrors. The main guest image (the PE at 0x7ff6b...) is MEM_IMAGE memory, which
 // VK_EXT_external_memory_host refuses, and address-based shaders map every registered range, so each
 // of their builds copied the whole image (~55 MiB: ~40 MiB of read-only sections snapshotted and copied
@@ -510,6 +528,7 @@ const char* bindImport(const Context& context, HostImport& entry, VkExternalMemo
     if (const auto result = context.Function<PFN_vkAllocateMemory>("vkAllocateMemory")(context.device, &allocation, nullptr, &entry.memory); result != VK_SUCCESS) return failed("vkAllocateMemory", result);
     allocated = true;
     entry.memoryType = allocation.memoryTypeIndex;
+    CountBindProbe(0);
     if (const auto result = context.Function<PFN_vkBindBufferMemory>("vkBindBufferMemory")(context.device, entry.buffer, entry.memory, 0); result != VK_SUCCESS) return failed("vkBindBufferMemory", result);
     const VkBufferDeviceAddressInfo addressInfo{VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO, nullptr, entry.buffer};
     entry.address = context.Function<PFN_vkGetBufferDeviceAddressKHR>("vkGetBufferDeviceAddressKHR")(context.device, &addressInfo);
@@ -704,6 +723,7 @@ const char* createChunkedDmaBufImport(const Context& context, HostImport& entry,
         fits = false;
         return nullptr;
     }
+    CountBindProbe(1);
     if (const auto result = context.Function<PFN_vkBindBufferMemory>("vkBindBufferMemory")(context.device, buffer, chunk->memory, within); result != VK_SUCCESS) {
         destroy();
         failure = result;
@@ -934,6 +954,7 @@ const char* settleImport(const Context& context, HostImports& state, const HostI
             aliasInfo.size = std::min<VkDeviceSize>(entry.bytes, 65536);
             aliasInfo.usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
             if ((result = context.Function<PFN_vkCreateBuffer>("vkCreateBuffer")(context.device, &aliasInfo, nullptr, &alias)) != VK_SUCCESS) return "vkCreateBuffer (settle alias)";
+            CountBindProbe(2);
             if ((result = context.Function<PFN_vkBindBufferMemory>("vkBindBufferMemory")(context.device, alias, entry.memory, 0)) != VK_SUCCESS) return "vkBindBufferMemory (settle alias)";
             source = alias;
         }
@@ -3317,6 +3338,7 @@ void runImportProbe(const Context& context, std::uint64_t base, std::uint64_t by
         allocation.allocationSize = requirements.size;
         allocation.memoryTypeIndex = static_cast<std::uint32_t>(std::countr_zero(requirements.memoryTypeBits));
         if ((probe.result = context.Function<PFN_vkAllocateMemory>("vkAllocateMemory")(context.device, &allocation, nullptr, &destinationMemory)) != VK_SUCCESS) return "vkAllocateMemory";
+        CountBindProbe(3);
         if ((probe.result = context.Function<PFN_vkBindBufferMemory>("vkBindBufferMemory")(context.device, destination, destinationMemory, 0)) != VK_SUCCESS) return "vkBindBufferMemory";
         VkCommandBufferAllocateInfo allocate{VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
         allocate.commandPool = context.pool;
