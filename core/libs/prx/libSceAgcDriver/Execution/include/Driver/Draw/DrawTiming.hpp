@@ -18,6 +18,16 @@ struct DrawPhaseTotals {
     std::chrono::steady_clock::time_point lastReport = std::chrono::steady_clock::now();
 };
 
+struct IndirectDrawTotals {
+    std::array<std::uint64_t, 2> draws{};
+    std::array<double, 2> validateMs{};
+    std::array<double, 2> materializeMs{};
+    std::array<double, 2> recordMs{};
+    std::chrono::steady_clock::time_point lastReport = std::chrono::steady_clock::now();
+};
+
+void addIndirectDrawPhases(bool cpuPath, double validateMs, double materializeMs, double recordMs);
+
 struct PendingDrawPhases {
     bool phases = false;
     std::uint64_t captures = 0;

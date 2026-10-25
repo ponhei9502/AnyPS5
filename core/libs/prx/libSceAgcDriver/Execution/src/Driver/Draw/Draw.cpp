@@ -828,8 +828,13 @@ DrawVerdict Driver::finishDraw(DrawTail& tail, PerformanceTimer& timing) {
     std::string& rejected = tail.rejected != nullptr ? *tail.rejected : tail.ownRejected;
     static const QueueState noQueue{};
     const QueueState& queue = tail.queue != nullptr ? *tail.queue : noQueue;
+    bool indirectProbeCpu = false;
     const auto drawn = [&] {
         phaseTiming.Phase(DrawRowVectors);
+        static const bool indirectProbe = std::getenv("APS5_PROFILE_INDIRECT") != nullptr;
+        if (indirectProbe && drawParameters.indirect && (tail.packetOpcode == 0x25u || tail.packetOpcode == 0x38u)) {
+            addIndirectDrawPhases(indirectProbeCpu, phaseMs[DrawRowKeyLookupValidate] + phaseMs[DrawRowValidateWait], phaseMs[DrawRowDecode] + phaseMs[DrawRowProgramPrepare] + phaseMs[DrawRowCapture] + phaseMs[DrawRowCaptureHookWaits] + phaseMs[DrawRowRecompile], phaseMs[DrawRowGraphics]);
+        }
         if (!profile) return DrawVerdict::Drawn;
         auto& pending = pendingDrawPhases();
         pending.phases = true;
@@ -1103,6 +1108,7 @@ DrawVerdict Driver::finishDraw(DrawTail& tail, PerformanceTimer& timing) {
             indirectCpu = Graphics::IndirectDrawPath::NotFolded;
         }
     }
+    if (drawParameters.indirect) indirectProbeCpu = indirectCpu.has_value();
     snapshot();
     timing.Mark("post_compile_prepare");
     const auto lockForDraw = [&] {
