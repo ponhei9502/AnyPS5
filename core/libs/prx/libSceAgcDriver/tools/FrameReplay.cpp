@@ -72,6 +72,7 @@ struct Options {
     bool synthesize = true;
     bool checkSubmits = false;
     bool dryCheck = false;
+    std::chrono::seconds settle{0};   // B71d: wait this long after the prologue before the window, so the pipeline-journal replay (background) is done and replay_s does not race it
     std::uint64_t cutCall = 0;   // B71d probe: submit only the first cutCommand draw/dispatch commands of this call, probe, then exit
     std::uint32_t cutCommand = 0;
 };
@@ -969,6 +970,7 @@ int usage() {
                          "  replays the driver calls and guest memory that APS5_FRAME_CAPTURE=<directory> recorded, through this\n"
                          "  build's AGC driver with no title running, and prints one JSON line with the frame times\n"
                          "  --no-pace           issues calls without waiting for the in-flight depth the title had\n"
+                         "  --settle-s <n>      waits n seconds after the prologue so the background pipeline-journal replay finishes before the timed window\n"
                          "  --no-release        the default: never copies recorded CPU stores early to release a GPU wait\n"
                          "  --release-after-ms  turns the early release ON: milliseconds without a completion before awaited dwords are released (it breaks cross-queue ordering; off by default)\n"
                          "  --pace-timeout-ms   milliseconds a paced call waits for its in-flight depth before giving up (10000)\n"
@@ -1117,6 +1119,10 @@ int run(const Options& options) {
     const auto& calls = reader.Calls();
     const auto frameStart = std::find_if(calls.begin(), calls.end(), [](const FrameCall& call) { return call.kind == FrameCallKind::FrameStart; });
     for (auto call = calls.begin(); call != frameStart; ++call) replay.execute(*call);
+    if (options.settle.count() > 0) {
+        std::fprintf(stderr, "[frame-replay] settle: waiting %lld s for background pipeline builds before the window\n", static_cast<long long>(options.settle.count()));
+        std::this_thread::sleep_for(options.settle);
+    }
     replay.recording = true;
     replay.startedAt = Clock::now();
     if (frameStart != calls.end()) replay.runWindow(std::span(calls).subspan(static_cast<std::size_t>(frameStart - calls.begin()) + 1));
@@ -1165,6 +1171,7 @@ int main(int argc, char** argv) {
         else if (argument == "--strict") options.strict = true;
         else if (argument == "--cut-call" && index + 1 < argc) options.cutCall = std::strtoull(argv[++index], nullptr, 10);
         else if (argument == "--cut-command" && index + 1 < argc) options.cutCommand = static_cast<std::uint32_t>(std::strtoul(argv[++index], nullptr, 10));
+        else if (argument == "--settle-s" && index + 1 < argc) options.settle = std::chrono::seconds(std::strtoll(argv[++index], nullptr, 10));
         else if (argument == "--check-submits") options.checkSubmits = true;
         else if (argument == "--dry-check") { options.dryCheck = true; options.checkSubmits = true; }
         else if (argument == "--dump" && index + 1 < argc) options.dumps.push_back(parseDump(argv[++index]));
