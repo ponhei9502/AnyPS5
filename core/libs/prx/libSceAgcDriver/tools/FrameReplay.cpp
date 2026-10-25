@@ -27,6 +27,7 @@
 #include <mutex>
 #include <optional>
 #include <stdexcept>
+#include <set>
 #include <string>
 #include <string_view>
 #include <thread>
@@ -36,6 +37,7 @@
 #include <windows.h>
 #else
 #include <sys/mman.h>
+#include "prx/libkernel/DirectMemory/DirectMemory.hpp" // B71d-e
 #endif
 
 namespace {
@@ -229,12 +231,43 @@ Skipped restoreMemory(const FrameCaptureReader& reader) {
     progress();
     Skipped skipped;
     mapHostRanges(reader, skipped);
+#ifndef _WIN32
+    // B71d-e: the title's Sections live in a shared memfd the driver imports into Vulkan; map them as direct memory so the driver
+    // finds the same memory to import instead of copying the whole buffer build. Done before the Mutation below: DoMapDirect takes its own.
+    std::set<const FrameMemoryChunk*> directMapped;
+    {
+        std::uint64_t directSections = 0;
+        std::uint64_t directSectionBytes = 0;
+        for (const auto& chunk : reader.Chunks()) {
+            if (chunk.kind != FrameMemoryKind::Range || chunk.rangeKind != FrameRangeKind::Section) continue;
+            if (chunk.address % PS5_PAGE_SIZE != 0 || chunk.bytes % PS5_PAGE_SIZE != 0 || committedWritable(chunk.address, chunk.bytes)) continue;
+            const auto bytes = static_cast<std::size_t>(chunk.bytes);
+            bool mappedDirect = false;
+            try {
+                int64_t physical = 0;
+                if (DirectMemoryAlloc(0, static_cast<int64_t>(DIRECT_MEMORY_SIZE), bytes, PS5_PAGE_SIZE, 0, &physical) == 0) {
+                    void* mapped = reinterpret_cast<void*>(static_cast<std::uintptr_t>(chunk.address));
+                    const int protection = 3 | ((chunk.access & FrameRangeAccess::Gpu) != 0 ? 0x30 : 0);
+                    mappedDirect = DoMapDirect(&mapped, bytes, protection, 0x10, physical, PS5_PAGE_SIZE) == 0 && mapped == reinterpret_cast<void*>(static_cast<std::uintptr_t>(chunk.address));
+                }
+            } catch (const std::exception&) {
+                mappedDirect = false;
+            }
+            if (!mappedDirect) continue;
+            directMapped.insert(&chunk);
+            ++directSections;
+            directSectionBytes += chunk.bytes;
+        }
+        std::fprintf(stderr, "[frame-replay] B71d-e: %llu Section ranges mapped as direct memory (%llu MiB)\n", static_cast<unsigned long long>(directSections), static_cast<unsigned long long>(directSectionBytes / (1024u * 1024u)));
+    }
+#endif
     {
         GuestAllocations::Mutation mutation;
         for (const auto& chunk : reader.Chunks()) {
             if (chunk.kind != FrameMemoryKind::Range || chunk.rangeKind == FrameRangeKind::Host) continue;
             const bool gpu = (chunk.access & FrameRangeAccess::Gpu) != 0;
 #ifndef _WIN32
+            if (directMapped.contains(&chunk)) continue;
             // The AGC driver's own 2 MiB block (Lifecycle.cpp MapDriverMemory, 0xfe0000000 in the system-reserved range) is mapped
             // with mmap outside the guest arena, so the arena refuses it here; this replay's driver maps and fills it itself.
             if (chunk.address == 0xfe0000000ull + GuestArena::GuestAddressOffset && !committedWritable(chunk.address, chunk.bytes)) {
