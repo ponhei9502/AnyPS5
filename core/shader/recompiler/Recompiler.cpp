@@ -406,6 +406,8 @@ struct SourceEntry : std::enable_shared_from_this<SourceEntry> {
     std::unique_ptr<ResultMemoTable> memo;
     std::uint64_t memoClock = 0;
     std::unordered_set<std::uint64_t> memoGhosts;
+    // B104-2 verify: pointer-free key -> (SPIR-V words pointer, binding count) of the last result materialized under it.
+    std::unordered_map<std::uint64_t, std::pair<const void*, std::size_t>> pfSeen;
     std::unique_ptr<ResourceSnapshot> keyDiffLast;
     std::uint64_t keyDiffVariant = 0;
 };
@@ -1560,11 +1562,27 @@ ResultMemoEntry* memoSet(SourceEntry& source, std::uint64_t index) {
     return source.memo->data() + static_cast<std::size_t>((index ^ (index >> 32u)) % ResultMemoSets()) * ResultMemoWays;
 }
 
+}  // namespace (reopened below)
+}  // namespace ShaderRecompiler
+// Defined by the AGC driver (GuestMemory.cpp) when it links the recompiler: the calling thread's GpuMutex queue tag
+// (0xffffffff untagged). Weak, so test binaries without the driver read every thread as untagged.
+extern "C" std::uint32_t AnyPS5MemoThreadTag() __attribute__((weak));
+namespace ShaderRecompiler {
+namespace {
+bool PointerFreeVerify() {
+    static const bool on = [] { const char* value = std::getenv("APS5_MEMO_POINTER_FREE_KEYS"); return value != nullptr && std::strcmp(value, "verify") == 0; }();
+    return on;
+}
+
 struct ResultMemoCounters {
     std::atomic<std::uint64_t> hits{0}, misses{0}, evictions{0}, populateNanoseconds{0};
     std::atomic<std::uint64_t> ghostHits{0}, liveEntries{0}, tables{0};
     std::atomic<std::int64_t> lastReport{0};
     std::atomic<std::uint64_t> currentSpirvWords{0};
+    // B104-2 verify (APS5_MEMO_POINTER_FREE_KEYS=verify): misses a pointer-free key would have hit, their materialize ns by the
+    // paying thread's GpuMutex queue tag (queue 0 / other queues / untagged), and disagreements (different SPIR-V).
+    std::atomic<std::uint64_t> pfCompared{0}, pfWouldHit{0}, pfDisagree{0};
+    std::array<std::atomic<std::uint64_t>, 3> pfNs{};
     std::atomic<std::uint64_t> keyDiffCompared{0}, keyDiffBufferAddress{0}, keyDiffBufferOther{0}, keyDiffImageAddress{0}, keyDiffImageOther{0}, keyDiffSampler{0}, keyDiffSrt{0}, keyDiffUserData{0}, keyDiffFill{0}, keyDiffTables{0}, keyDiffTableBase{0}, keyDiffOther{0}, keyDiffOnlyAddresses{0};
     std::array<std::atomic<std::uint64_t>, 64> keyDiffUserDataIndex{};
 };
@@ -1590,6 +1608,17 @@ void reportResultMemo() {
     const auto evictions = counters.evictions.exchange(0, std::memory_order_relaxed);
     const auto populate = counters.populateNanoseconds.exchange(0, std::memory_order_relaxed);
     std::fprintf(stderr, "[recompile] result memo (10 s): %llu hits, %llu misses (%.1f%% hits), Populate %.1f us per miss / %.1f ms in total, %llu evictions\n", static_cast<unsigned long long>(hits), static_cast<unsigned long long>(misses), hits + misses != 0 ? 100.0 * static_cast<double>(hits) / static_cast<double>(hits + misses) : 0.0, misses != 0 ? static_cast<double>(populate) / 1000.0 / static_cast<double>(misses) : 0.0, static_cast<double>(populate) / 1e6, static_cast<unsigned long long>(evictions));
+    if (PointerFreeVerify()) {
+        static ImageTableReuseCounts previousTables{};
+        const auto tables = ResourceMaterializer::TableReuse();
+        const auto ms = [&](std::size_t i) { return static_cast<double>(counters.pfNs[i].exchange(0, std::memory_order_relaxed)) / 1e6; };
+        const double q0 = ms(0), other = ms(1), untagged = ms(2);
+        std::fprintf(stderr, "[recompile] memo pointer-free verify (10 s): would hit %llu of %llu misses, disagreements %llu; materialize time of the would-hit misses: queue0 %.1f ms, other queues %.1f ms, untagged %.1f ms; table memo: %llu resolved, %llu shared\n",
+                     static_cast<unsigned long long>(counters.pfWouldHit.exchange(0, std::memory_order_relaxed)), static_cast<unsigned long long>(counters.pfCompared.exchange(0, std::memory_order_relaxed)),
+                     static_cast<unsigned long long>(counters.pfDisagree.exchange(0, std::memory_order_relaxed)), q0, other, untagged,
+                     static_cast<unsigned long long>(tables.resolutions - previousTables.resolutions), static_cast<unsigned long long>(tables.resolutionsShared - previousTables.resolutionsShared));
+        previousTables = tables;
+    }
     static const bool keyDiff = std::getenv("APS5_MEMO_KEY_DIFF") != nullptr;
     if (keyDiff) {
         const auto compared = counters.keyDiffCompared.exchange(0, std::memory_order_relaxed);
@@ -1630,7 +1659,10 @@ void reportResultMemo() {
 // Everything materializeResult reads besides the variant: the snapshot (the descriptor words, the
 // flattened SRT, the user data, the uniform fill) and, for the vertex family, the V# table the
 // attributes are resolved from.
-std::uint64_t snapshotHash(const RecompileRequest& request, const ResourceSnapshot& snapshot) {
+// pointerFree (B104-2 verify, APS5_MEMO_POINTER_FREE_KEYS=verify): leave out the pointer words: buffer V# dw0 and dw1 & 0xffff,
+// image T# dw0 and dw1 & 0xff, every SRT and user-data word (an upper bound; KEYDIFF's 42 % is the lower bound), table bases,
+// table words/readRanges hashes and range bases. Used for counting only; the memo still keys on the full hash.
+std::uint64_t snapshotHash(const RecompileRequest& request, const ResourceSnapshot& snapshot, bool pointerFree = false) {
     std::uint64_t hash = 0xcbf29ce484222325ull;
     const auto mix = [&](std::uint64_t value) {
         hash ^= value;
@@ -1640,19 +1672,24 @@ std::uint64_t snapshotHash(const RecompileRequest& request, const ResourceSnapsh
         mix(words.size());
         for (const auto word : words) mix(word);
     };
-    const auto mixDescriptors = [&](const std::vector<DescriptorValue>& values) {
+    const auto mixDescriptors = [&](const std::vector<DescriptorValue>& values, std::uint32_t addressHighMask = 0) {
         mix(values.size());
         for (const auto& value : values) {
             mix(value.dwordCount);
             mix(value.availableDwordMask);
-            for (std::uint32_t i = 0; i < value.dwordCount && i < value.dwords.size(); ++i) mix(value.dwords[i]);
+            for (std::uint32_t i = 0; i < value.dwordCount && i < value.dwords.size(); ++i) {
+                if (pointerFree && addressHighMask != 0 && i == 0) continue;
+                mix(pointerFree && addressHighMask != 0 && i == 1 ? value.dwords[i] & ~addressHighMask : value.dwords[i]);
+            }
         }
     };
-    mixDescriptors(snapshot.buffers);
-    mixDescriptors(snapshot.images);
+    mixDescriptors(snapshot.buffers, 0xffffu);
+    mixDescriptors(snapshot.images, 0xffu);
     mixDescriptors(snapshot.samplers);
-    mixWords(snapshot.flattenedSrt);
-    mixWords(snapshot.userData);
+    if (!pointerFree) {
+        mixWords(snapshot.flattenedSrt);
+        mixWords(snapshot.userData);
+    }
     mix(static_cast<std::uint64_t>(snapshot.uniformFill.kind));
     mix(snapshot.uniformFill.resource);
     for (const auto stride : snapshot.uniformFill.groupStride) mix(stride);
@@ -1662,19 +1699,21 @@ std::uint64_t snapshotHash(const RecompileRequest& request, const ResourceSnapsh
     mix(tables.shader);
     mix(tables.tables.size());
     for (const auto& table : tables.tables) {
-        mix(table.base);
+        if (!pointerFree) mix(table.base);
         mix(table.size);
         mix(table.records);
         mix(table.keys);
         mix(table.fault);
         mix(table.outside ? 1u : 0u);
         mix(table.codes.Hash());
-        mix(table.words.Hash());
-        mix(table.readRanges.Hash());
+        if (!pointerFree) {
+            mix(table.words.Hash());
+            mix(table.readRanges.Hash());
+        }
     }
     mix(tables.ranges.size());
     for (const auto& [base, size] : tables.ranges) {
-        mix(base);
+        if (!pointerFree) mix(base);
         mix(size);
     }
     for (const auto threads : partialThreads(request)) mix(threads);
@@ -1724,8 +1763,10 @@ std::shared_ptr<const RecompileResult> materializePreparedMemoized(SourceEntry& 
             }
         }
     }
-    const auto started = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+    const bool pfVerify = PointerFreeVerify();
+    const auto started = profile || pfVerify ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     auto result = std::make_shared<RecompileResult>(materializeResult(*variant, request, snapshot));
+    const auto materializeNs = pfVerify ? static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - started).count()) : 0u;
     result->cacheHit = cacheHit;
     if (profile) counters.populateNanoseconds.fetch_add(static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - started).count()), std::memory_order_relaxed);
     counters.misses.fetch_add(1, std::memory_order_relaxed);
@@ -1796,6 +1837,22 @@ std::shared_ptr<const RecompileResult> materializePreparedMemoized(SourceEntry& 
         if (keyDiff) {
             source.keyDiffLast = std::make_unique<ResourceSnapshot>(snapshot);
             source.keyDiffVariant = variant->artifact.variantId;
+        }
+        if (pfVerify) {
+            const auto key = (variant->artifact.variantId * 0x9e3779b97f4a7c15ull) ^ snapshotHash(request, snapshot, true);
+            const auto& words = shared->spirv.Words();
+            const std::pair<const void*, std::size_t> mine{words.data(), words.size()};
+            counters.pfCompared.fetch_add(1, std::memory_order_relaxed);
+            if (const auto seen = source.pfSeen.find(key); seen != source.pfSeen.end()) {
+                counters.pfWouldHit.fetch_add(1, std::memory_order_relaxed);
+                // Same module object, or same size and words (a rebuilt identical module) = agreement.
+                const bool same = seen->second == mine || (seen->second.second == mine.second && std::memcmp(seen->second.first, mine.first, mine.second * sizeof(words[0])) == 0);
+                if (!same) counters.pfDisagree.fetch_add(1, std::memory_order_relaxed);
+                const auto tag = AnyPS5MemoThreadTag != nullptr ? AnyPS5MemoThreadTag() : 0xffffffffu;
+                counters.pfNs[tag == 0u ? 0 : tag == 0xffffffffu ? 2 : 1].fetch_add(materializeNs, std::memory_order_relaxed);
+            }
+            if (source.pfSeen.size() > 4u * ResultMemoSets() * ResultMemoWays) source.pfSeen.clear();
+            source.pfSeen[key] = mine;
         }
         if (ghost && source.memoGhosts.erase(index) != 0) counters.ghostHits.fetch_add(1, std::memory_order_relaxed);
         if (source.memo == nullptr) {

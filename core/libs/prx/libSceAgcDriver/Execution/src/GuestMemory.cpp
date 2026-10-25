@@ -2695,3 +2695,7 @@ extern "C" void AgcDriverStoreGuestLabel_nid_postfix(std::uint64_t* pointer, std
         std::atomic_ref(*pointer).store(value, std::memory_order_release);
     });
 }
+
+// B104-2 verify (APS5_MEMO_POINTER_FREE_KEYS=verify): the recompiler (same library) reads the calling thread's GpuMutex queue tag
+// through this (a weak reference there).
+extern "C" std::uint32_t AnyPS5MemoThreadTag() { return AgcDriver::GuestMemory::GpuLockThreadTag(); }
