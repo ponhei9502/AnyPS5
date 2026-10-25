@@ -389,6 +389,7 @@ struct Replay {
     std::atomic<std::uint64_t> badHeaderSubmits{0};
     std::atomic<std::size_t> sequenced{0};
     std::atomic<bool> stallDescribed{false}; // B71d-g
+    std::atomic<std::int64_t> longestPaceWaitNs{0};
     std::uint64_t unfinished = 0;
     std::size_t threads = 0;
     bool recording = false;
@@ -420,10 +421,21 @@ struct Replay {
         const bool memory = call.kind == FrameCallKind::Memory;
         const auto began = Clock::now();
         const auto deadline = began + (memory ? options.memoryPaceTimeout : options.paceTimeout);
-        const auto waited = [&] { paceWaitedNs += std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now() - began).count(); };
+        const auto waited = [&] {
+            const auto elapsed = std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now() - began).count();
+            paceWaitedNs += elapsed;
+            auto longest = longestPaceWaitNs.load();
+            while (elapsed > longest && !longestPaceWaitNs.compare_exchange_weak(longest, elapsed)) {}
+        };
         while (true) {
             const auto [accepted, completed] = progress();
-            if (accepted - completed <= inFlight) return waited();
+            if (accepted - completed <= inFlight) {
+                const auto elapsed = std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now() - began).count();
+                if (elapsed > 1000000000) std::fprintf(stderr, "[frame-replay] retire: call %llu (%s) waited %.1f s for serials %llu/%llu\n", static_cast<unsigned long long>(call.ordinal),
+                                                       std::string(AgcDriver::FrameCallName(call.kind)).c_str(), static_cast<double>(elapsed) / 1e9, static_cast<unsigned long long>(completed),
+                                                       static_cast<unsigned long long>(accepted));
+                return waited();
+            }
             if (Clock::now() >= deadline) {
                 waited();
                 if (memory) return;
@@ -719,6 +731,8 @@ int usage() {
                          "  --no-pace           issues calls without waiting for the in-flight depth the title had\n"
                          "  --no-release        never copies recorded CPU stores early to release a GPU wait\n"
                          "  --release-after-ms  milliseconds without a completion before awaited dwords are released (3)\n"
+                         "  --pace-timeout-ms   milliseconds a paced call waits for its in-flight depth before giving up (10000)\n"
+                         "  --drain-timeout-ms  milliseconds without a completion before the drain gives up (10000)\n"
                          "  --no-synthesize     releases a wait only with a value the capture recorded, never with its reference value\n"
                          "  --strict            fails on a pacing timeout or a failed registration inside the captured frames\n"
                          "  --check-submits     reports zero-filled or malformed PM4 submissions in the JSON line\n"
@@ -873,14 +887,14 @@ int run(const Options& options) {
     std::sort(frameMs.begin(), frameMs.end());
     const auto percentile = [&](double fraction) { return frameMs.empty() ? 0.0 : frameMs[std::min(frameMs.size() - 1, static_cast<std::size_t>(fraction * static_cast<double>(frameMs.size())))]; };
     const auto seconds = std::chrono::duration<double>(replay.endedAt - replay.startedAt).count();
-    std::printf("{\"frames\":%zu,\"replay_s\":%.3f,\"fps\":%.3f,\"frame_ms\":{\"p50\":%.3f,\"p90\":%.3f,\"max\":%.3f,\"each\":[%s]},\"submits\":%llu,\"delta_mib\":%.1f,\"pace_timeouts\":%llu,\"pace_wait_s\":%.3f,\"stale_registrations\":%llu,\"failed_registrations\":%llu,\"skipped_mib\":%.1f,\"threads\":%zu,\"released_waits\":%llu,\"of_them_from_earlier_writes\":%llu,\"of_them_synthesized\":%llu,\"unfinished\":%llu,\"frames_compared\":%zu,\"pixels_identical\":%.6f,\"max_channel_diff\":%d,\"load_s\":%.3f,\"zero_submits\":%llu,\"bad_header_submits\":%llu}\n",
+    std::printf("{\"frames\":%zu,\"replay_s\":%.3f,\"fps\":%.3f,\"frame_ms\":{\"p50\":%.3f,\"p90\":%.3f,\"max\":%.3f,\"each\":[%s]},\"submits\":%llu,\"delta_mib\":%.1f,\"pace_timeouts\":%llu,\"pace_wait_s\":%.3f,\"stale_registrations\":%llu,\"failed_registrations\":%llu,\"skipped_mib\":%.1f,\"threads\":%zu,\"released_waits\":%llu,\"of_them_from_earlier_writes\":%llu,\"of_them_synthesized\":%llu,\"unfinished\":%llu,\"frames_compared\":%zu,\"pixels_identical\":%.6f,\"max_channel_diff\":%d,\"load_s\":%.3f,\"zero_submits\":%llu,\"bad_header_submits\":%llu,\"longest_pace_wait_s\":%.3f}\n",
                 ready.size(), seconds, seconds > 0 ? static_cast<double>(ready.size()) / seconds : 0.0, percentile(0.5), percentile(0.9), frameMs.empty() ? 0.0 : frameMs.back(), frameList.c_str(),
                 static_cast<unsigned long long>(replay.submits.load()), static_cast<double>(replay.deltaBytes.load()) / (1024.0 * 1024.0), static_cast<unsigned long long>(replay.paceTimeouts.load()),
                 replay.paceWaitedSeconds(), static_cast<unsigned long long>(replay.staleRegistrations.load()), static_cast<unsigned long long>(replay.failedRegistrations.load()),
                 static_cast<double>(replay.skipped.bytes) / (1024.0 * 1024.0), replay.threads, static_cast<unsigned long long>(replay.earlyReleases.load()), static_cast<unsigned long long>(replay.lateReleases.load()),
                 static_cast<unsigned long long>(replay.syntheticReleases.load()),
                 static_cast<unsigned long long>(replay.unfinished), check.compared, check.identical, check.maxDifference, std::chrono::duration<double>(loaded - loadStart).count(),
-                static_cast<unsigned long long>(replay.zeroSubmits.load()), static_cast<unsigned long long>(replay.badHeaderSubmits.load()));
+                static_cast<unsigned long long>(replay.zeroSubmits.load()), static_cast<unsigned long long>(replay.badHeaderSubmits.load()), static_cast<double>(replay.longestPaceWaitNs.load()) / 1e9);
     std::fflush(stdout);
     return replay.unfinished == 0 ? 0 : 3;
 }
@@ -895,6 +909,8 @@ int main(int argc, char** argv) {
         else if (argument == "--no-release") options.release = false;
         else if (argument == "--no-synthesize") options.synthesize = false;
         else if (argument == "--release-after-ms" && index + 1 < argc) options.releaseAfter = std::chrono::milliseconds(std::strtoll(argv[++index], nullptr, 10));
+        else if (argument == "--pace-timeout-ms" && index + 1 < argc) options.paceTimeout = std::chrono::milliseconds(std::strtoll(argv[++index], nullptr, 10));
+        else if (argument == "--drain-timeout-ms" && index + 1 < argc) options.drainTimeout = std::chrono::milliseconds(std::strtoll(argv[++index], nullptr, 10));
         else if (argument == "--strict") options.strict = true;
         else if (argument == "--check-submits") options.checkSubmits = true;
         else if (argument == "--dry-check") { options.dryCheck = true; options.checkSubmits = true; }
