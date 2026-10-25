@@ -96,6 +96,14 @@ std::uint64_t contentHash(std::span<const std::byte> bytes) {
     return hash == 0 ? 1 : hash;
 }
 
+// B71d-d: same check as Driver::RegisterShader
+bool shaderHeaderValid(std::uint64_t address) {
+    if (!GuestMemory::Accessible(reinterpret_cast<const void*>(address), sizeof(Shader))) return false;
+    Shader fields;
+    std::memcpy(&fields, reinterpret_cast<const void*>(address), sizeof(Shader));
+    return fields.file_header == 0x34333231u && fields.version == 0x18u;
+}
+
 }
 
 FrameRecorder* FrameRecorder::Active() {
@@ -477,7 +485,32 @@ void FrameRecorder::start() {
         snapshot(range);
         if (!writer) return;
     }
-    for (const auto& call : prologue) writer->WriteCall(call);
+    std::uint64_t droppedPrologue = 0;
+    for (const auto& call : prologue) {
+        bool keep = true;
+        if (call.kind == FrameCallKind::RegisterShader || call.kind == FrameCallKind::ResolveShaderAbi) {
+            keep = call.address == 0 || shaderHeaderValid(call.address);
+        } else if (call.kind == FrameCallKind::ResolveGraphicsAbi) {
+            keep = (call.values[0] == 0 || shaderHeaderValid(call.values[0])) && (call.values[1] == 0 || shaderHeaderValid(call.values[1]));
+        } else if (call.kind == FrameCallKind::ResolveGraphicsStagesAbi) {
+            keep = true;
+            for (const auto address : call.values) {
+                if (address != 0 && !shaderHeaderValid(address)) {
+                    keep = false;
+                    break;
+                }
+            }
+        }
+        if (!keep) {
+            ++droppedPrologue;
+            continue;
+        }
+        writer->WriteCall(call);
+    }
+    if (droppedPrologue != 0) {
+        warnings.push_back("dropped " + std::to_string(droppedPrologue) + " prologue shader calls whose header was invalid at capture start");
+        std::fprintf(stderr, "[frame-capture] B71d-d: dropped %llu stale prologue shader calls\n", static_cast<unsigned long long>(droppedPrologue));
+    }
     std::uintptr_t ringBase = 0;
     std::uint32_t ringSize = 0;
     sceAgcDriverGetTFRing(&ringBase, &ringSize);
