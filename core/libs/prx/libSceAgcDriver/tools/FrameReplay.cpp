@@ -811,6 +811,17 @@ FrameCheck compareFrames(const FrameCaptureReader& reader, const Options& option
         check.identical = std::min(check.identical, total == 0 ? 1.0 : static_cast<double>(same) / static_cast<double>(total));
         if (options.frames.empty()) continue;
         const auto index = std::to_string(call.values[0]);
+        // B71d diagnostic: the raw texels (no DCC key handling) beside the decoded frame, to tell "GPU wrote nothing" from "DCC keys hide it".
+        try {
+            const auto raw = AgcDriver::ReadDisplayBufferTexels(buffer);
+            std::uint64_t sum[4] = {0, 0, 0, 0};
+            for (std::size_t i = 0; i + 3 < raw.size(); i += 4 * 97) for (int c = 0; c < 4; ++c) sum[c] += static_cast<unsigned>(raw[i + c]);
+            const auto n = std::max<std::size_t>(1, raw.size() / (4 * 97));
+            std::fprintf(stderr, "[frame-replay] raw texels of display buffer %s: mean byte0..3 %.1f %.1f %.1f %.1f\n", index.c_str(), static_cast<double>(sum[0]) / n, static_cast<double>(sum[1]) / n, static_cast<double>(sum[2]) / n, static_cast<double>(sum[3]) / n);
+            writeFrame(options.frames / ("replay-raw-" + index + ".bmp"), buffer, raw);
+        } catch (const std::exception& error) {
+            std::fprintf(stderr, "[frame-replay] raw texels of display buffer %s: %s\n", index.c_str(), error.what());
+        }
         writeFrame(options.frames / ("reference-" + index + ".bmp"), buffer, reference);
         writeFrame(options.frames / ("replay-" + index + ".bmp"), buffer, replayed);
     }
