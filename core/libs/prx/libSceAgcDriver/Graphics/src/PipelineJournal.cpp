@@ -53,34 +53,6 @@ constexpr std::uint32_t GraphicsRecord = 2u;
 constexpr std::uint32_t ComputeRecord = 3u;
 constexpr std::uint64_t RecordAlignment = 8u;
 
-#ifndef _WIN32
-struct MappedJournal {
-    const std::byte* data = nullptr;
-    std::size_t size = 0;
-    ~MappedJournal() {
-        if (data != nullptr && data != MAP_FAILED) munmap(const_cast<std::byte*>(data), size);
-    }
-};
-
-std::shared_ptr<const MappedJournal> mapJournal(const std::filesystem::path& path) {
-    const int fd = ::open(path.string().c_str(), O_RDONLY | O_CLOEXEC);
-    if (fd < 0) return nullptr;
-    struct stat info {};
-    if (::fstat(fd, &info) != 0 || info.st_size <= 0) {
-        ::close(fd);
-        return nullptr;
-    }
-    const auto size = static_cast<std::size_t>(info.st_size);
-    void* mapping = ::mmap(nullptr, size, PROT_READ, MAP_PRIVATE, fd, 0);
-    ::close(fd);
-    if (mapping == MAP_FAILED) return nullptr;
-    auto journal = std::make_shared<MappedJournal>();
-    journal->data = static_cast<const std::byte*>(mapping);
-    journal->size = size;
-    return journal;
-}
-#endif
-
 struct FileHeader {
     std::uint32_t magic;
     std::uint32_t format;
@@ -778,10 +750,6 @@ public:
         if (!Enabled() || !bound.load(std::memory_order_acquire)) return loaded;
         const auto started = std::chrono::steady_clock::now();
         bool read = false;
-        bool mapped = false;
-#ifndef _WIN32
-        std::shared_ptr<const MappedJournal> mapping;
-#endif
         {
             FileLock fileLock(lockPath);
             auto file = std::make_shared<const JournalFile>(path);
@@ -805,7 +773,7 @@ public:
             counters.droppedRecords.store(loaded.dropped, std::memory_order_relaxed);
             loadMs.store(ms, std::memory_order_relaxed);
         }
-        if (loaded.bytes != 0 || loaded.dropped != 0) std::fprintf(stderr, "[pipeline-journal] loaded %zu pipelines and %zu modules (%.1f MiB) from %s in %.0f ms%s%s\n", loaded.entries.size(), loaded.modules.size(), static_cast<double>(loaded.bytes) / (1024.0 * 1024.0), path.string().c_str(), ms, !loaded.headerValid ? "; written by another build or device, starting over" : loaded.dropped != 0 ? "; the file's tail was unreadable and is dropped" : "", mapped ? " (mapped)" : "");
+        if (loaded.bytes != 0 || loaded.dropped != 0) std::fprintf(stderr, "[pipeline-journal] loaded %zu pipelines and %zu modules (%.1f MiB) from %s in %.0f ms%s\n", loaded.entries.size(), loaded.modules.size(), static_cast<double>(loaded.bytes) / (1024.0 * 1024.0), path.string().c_str(), ms, !loaded.headerValid ? "; written by another build or device, starting over" : loaded.dropped != 0 ? "; the file's tail was unreadable and is dropped" : "");
         return loaded;
     }
 
