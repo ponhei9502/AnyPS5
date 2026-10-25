@@ -320,6 +320,7 @@ std::vector<FrameRecorder::Range> FrameRecorder::newRanges() {
             auto piece = range;
             piece.address = at;
             piece.bytes = (next == covered.end() ? end : std::min(end, next->first)) - at;
+            if (piece.inode != 0) piece.fileOffset += at - range.address;
             added.push_back(piece);
             at += piece.bytes;
         }
@@ -415,6 +416,7 @@ void FrameRecorder::writeDelta(std::span<const Span> spans, std::span<const std:
             GuestMemory::ReadCommittedUnsynced(begin, bytes);
             writer->WriteDelta(group, completed, begin, bytes);
             deltaBytes += bytes.size();
+            writeAliases(group, completed, begin, end, bytes);
             any = true;
         }
     }
@@ -426,6 +428,30 @@ void FrameRecorder::writeDelta(std::span<const Span> spans, std::span<const std:
     call.completed = completed;
     call.values = {group};
     writer->WriteCall(call);
+}
+
+void FrameRecorder::writeAliases(std::uint64_t group, std::uint64_t completed, std::uint64_t begin, std::uint64_t end, std::vector<std::byte>& scratch) {
+    const Range* owner = nullptr;
+    for (const auto& range : ranges) {
+        if (range.inode != 0 && begin >= range.address && begin < range.address + range.bytes) {
+            owner = &range;
+            break;
+        }
+    }
+    if (owner == nullptr) return;
+    const std::uint64_t fileBegin = owner->fileOffset + (begin - owner->address);
+    const std::uint64_t fileEnd = fileBegin + (end - begin);
+    for (const auto& range : ranges) {
+        if (range.inode != owner->inode || !range.readable || range.address == owner->address) continue;
+        const std::uint64_t overlapBegin = std::max(fileBegin, range.fileOffset);
+        const std::uint64_t overlapEnd = std::min(fileEnd, range.fileOffset + range.bytes);
+        if (overlapBegin >= overlapEnd) continue;
+        const std::uint64_t address = range.address + (overlapBegin - range.fileOffset);
+        scratch.resize(static_cast<std::size_t>(overlapEnd - overlapBegin));
+        GuestMemory::ReadCommittedUnsynced(address, scratch);
+        writer->WriteDelta(group, completed, address, scratch);
+        aliasBytes += scratch.size();
+    }
 }
 
 void FrameRecorder::snapshot(const Range& range) {
@@ -544,9 +570,9 @@ void FrameRecorder::finish() {
     writer->WriteCall(end);
     writeReferenceFrames();
     writer->Finish(header());
-    std::fprintf(stderr, "[frame-capture] %llu frames, %llu calls, %llu memory deltas (%.1f MiB), %.1f MiB raw, %.1f MiB stored in %s\n", static_cast<unsigned long long>(recordedFrames),
+    std::fprintf(stderr, "[frame-capture] %llu frames, %llu calls, %llu memory deltas (%.1f MiB), alias deltas %.1f MiB, %.1f MiB raw, %.1f MiB stored in %s\n", static_cast<unsigned long long>(recordedFrames),
                  static_cast<unsigned long long>(recordedCalls), static_cast<unsigned long long>(deltaGroups), static_cast<double>(deltaBytes) / (1024.0 * 1024.0),
-                 static_cast<double>(writer->RawBytes()) / (1024.0 * 1024.0), static_cast<double>(writer->StoredBytes()) / (1024.0 * 1024.0), directory.string().c_str());
+                 static_cast<double>(aliasBytes) / (1024.0 * 1024.0), static_cast<double>(writer->RawBytes()) / (1024.0 * 1024.0), static_cast<double>(writer->StoredBytes()) / (1024.0 * 1024.0), directory.string().c_str());
     writer.reset();
     state = State::Done;
 }
@@ -562,7 +588,7 @@ std::string FrameRecorder::header() const {
     text += ",\"start_boundary\":" + std::to_string(startBoundary) + ",\"frames\":" + std::to_string(recordedFrames);
     text += ",\"calls\":" + std::to_string(recordedCalls) + ",\"prologue_calls\":" + std::to_string(prologue.size());
     text += ",\"ranges\":" + std::to_string(ranges.size()) + ",\"late_ranges\":" + std::to_string(lateRanges) + ",\"snapshot_bytes\":" + std::to_string(snapshotBytes) + ",\"unreadable_bytes\":" + std::to_string(unreadableBytes);
-    text += ",\"memory_groups\":" + std::to_string(deltaGroups) + ",\"delta_bytes\":" + std::to_string(deltaBytes);
+    text += ",\"memory_groups\":" + std::to_string(deltaGroups) + ",\"delta_bytes\":" + std::to_string(deltaBytes) + ",\"alias_bytes\":" + std::to_string(aliasBytes);
     text += ",\"capture_seconds\":" + std::to_string(std::chrono::duration<double>(std::chrono::steady_clock::now() - startedAt).count());
     text += ",\"env\":{";
     bool first = true;
@@ -608,7 +634,7 @@ std::vector<FrameRecorder::Range> FrameRecorder::committedRanges() {
                 else if (info.Type == MEM_PRIVATE) range.kind = GuestMemory::Watched(range.address, static_cast<std::size_t>(range.bytes)) ? FrameRangeKind::Watched : FrameRangeKind::Unwatched;
                 else range.kind = FrameRangeKind::Section;
                 auto& last = result.empty() ? range : result.back();
-                if (!result.empty() && last.address + last.bytes == range.address && last.kind == range.kind && last.protection == range.protection && last.readable == range.readable && last.access == range.access) last.bytes += range.bytes;
+                if (!result.empty() && last.address + last.bytes == range.address && last.kind == range.kind && last.protection == range.protection && last.readable == range.readable && last.access == range.access && last.inode == range.inode && (range.inode == 0 || last.fileOffset + last.bytes == range.fileOffset)) last.bytes += range.bytes;
                 else result.push_back(range);
             }
             address = regionEnd;
@@ -631,6 +657,8 @@ std::vector<FrameRecorder::Range> FrameRecorder::committedRanges() {
         bool shared = false;
         bool memfd = false;
         bool file = false;
+        std::uint64_t offset = 0;
+        std::uint64_t inode = 0;
     };
     std::vector<Mapping> mappings;
     {
@@ -638,10 +666,10 @@ std::vector<FrameRecorder::Range> FrameRecorder::committedRanges() {
         if (!maps) throw std::runtime_error("frame capture: cannot read /proc/self/maps");
         std::string line;
         while (std::getline(maps, line)) {
-            unsigned long long start = 0, end = 0;
+            unsigned long long start = 0, end = 0, offset = 0, inode = 0;
             char perms[5] = {};
             int pathAt = 0;
-            if (std::sscanf(line.c_str(), "%llx-%llx %4s %*s %*s %*s %n", &start, &end, perms, &pathAt) < 3) continue;
+            if (std::sscanf(line.c_str(), "%llx-%llx %4s %llx %*s %llu %n", &start, &end, perms, &offset, &inode, &pathAt) < 5) continue;
             const std::string_view path = pathAt > 0 && static_cast<std::size_t>(pathAt) <= line.size() ? std::string_view(line).substr(static_cast<std::size_t>(pathAt)) : std::string_view();
             Mapping mapping;
             mapping.start = start;
@@ -651,6 +679,8 @@ std::vector<FrameRecorder::Range> FrameRecorder::committedRanges() {
             mapping.shared = perms[3] == 's';
             mapping.memfd = path.starts_with("/memfd:");
             mapping.file = !mapping.memfd && path.starts_with("/");
+            mapping.offset = offset;
+            mapping.inode = inode;
             mappings.push_back(mapping);
         }
     }
@@ -674,6 +704,10 @@ std::vector<FrameRecorder::Range> FrameRecorder::committedRanges() {
             range.protection = it->protection;
             range.access = access;
             range.readable = it->readable;
+            if (it->memfd) {
+                range.inode = it->inode;
+                range.fileOffset = it->offset + (pieceStart - it->start);
+            }
             if (host) range.kind = FrameRangeKind::Host;
             else if (it->memfd || it->shared) range.kind = FrameRangeKind::Section;
             else if (it->file) range.kind = FrameRangeKind::File;
