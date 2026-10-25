@@ -41,8 +41,13 @@ class DatabaseCacheTests(unittest.TestCase):
             database.write_text(f"{nid} sceExample\n", encoding="utf-8")
             scratch = str(Path(directory) / "scratch")
             Path(scratch).mkdir()
+            tree = Path(directory) / "tree"
+            (tree / "core" / "libs" / "prx").mkdir(parents=True)
+            (tree / "tools").mkdir()
+            tool = tree / "tools" / "nid_names.py"
+            tool.write_bytes(Path(script).read_bytes())
             environment = {**os.environ, "ANYPS5_NID_DB": str(database), "TEMP": scratch, "TMP": scratch, "TMPDIR": scratch}
-            result = subprocess.run([sys.executable, script, "--nid", nid, "--json"], capture_output=True, text=True,
+            result = subprocess.run([sys.executable, str(tool), "--nid", nid, "--json"], capture_output=True, text=True,
                                     env=environment, timeout=20)
             self.assertEqual(list(Path(scratch).iterdir()), [])
         self.assertEqual(result.returncode, 0, result.stderr)
@@ -424,6 +429,33 @@ int APS5_VABI sceReal() { return 0; }
     def test_spliced_line_comment_and_macro_tokens(self):
         self.write_source('// continued \\\nAPS5_EXPORT("AAAAAAAAAAA", exampleUnknown00);\nAPS5_EX\\\nPORT("BBBBBBBBBBB", exampleUnknown01);\n')
         self.assertEqual(nid_names.collect_unknowns(), {"BBBBBBBBBBB": "core/libs/prx/libSceExample/Export.cpp:exampleUnknown01"})
+
+    def test_main_reconfigures_streams(self):
+        class Stream:
+            def __init__(self):
+                self.encoding = None
+                self.errors = None
+
+            def reconfigure(self, encoding=None, errors=None):
+                self.encoding = encoding
+                self.errors = errors
+
+            def write(self, text):
+                pass
+
+            def flush(self):
+                pass
+
+        out, err = Stream(), Stream()
+        with patch.object(nid_names.sys, "stdout", out), patch.object(nid_names.sys, "stderr", err):
+            try:
+                nid_names.main(["--invalid-argument"])
+            except SystemExit:
+                pass
+        self.assertEqual(out.encoding, "utf-8")
+        self.assertEqual(out.errors, "backslashreplace")
+        self.assertEqual(err.encoding, "utf-8")
+        self.assertEqual(err.errors, "backslashreplace")
 
 
 

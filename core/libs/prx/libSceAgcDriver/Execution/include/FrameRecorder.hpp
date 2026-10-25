@@ -52,8 +52,11 @@ private:
         std::uint32_t protection = 0;
         std::uint32_t access = 0;
         bool readable = false;
+<<<<<<< HEAD
         std::uint64_t inode = 0;
         std::uint64_t fileOffset = 0;
+=======
+>>>>>>> origin/main
     };
 
     FrameRecorder(std::filesystem::path directory, std::filesystem::path trigger, std::uint64_t atBoundary, std::uint64_t frames);
@@ -68,7 +71,10 @@ private:
     void emitDelta();
     void emitShaderDelta(std::span<const Shader* const> shaders);
     void writeDelta(std::span<const Span> spans, std::span<const std::uint64_t> hostPages, std::span<const Range> added = {});
+<<<<<<< HEAD
     void writeAliases(std::uint64_t group, std::uint64_t completed, std::uint64_t begin, std::uint64_t end, std::vector<std::byte>& scratch); // B71d-c
+=======
+>>>>>>> origin/main
     bool triggered();
     void start();
     void finish();
@@ -100,7 +106,10 @@ private:
     std::uint64_t generation = 0;
     std::uint64_t deltaGroups = 0;
     std::uint64_t deltaBytes = 0;
+<<<<<<< HEAD
     std::uint64_t aliasBytes = 0;
+=======
+>>>>>>> origin/main
     std::uint64_t snapshotBytes = 0;
     std::uint64_t recordedCalls = 0;
     std::uint64_t startAttempts = 0;

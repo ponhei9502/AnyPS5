@@ -1,3 +1,7 @@
+<<<<<<< HEAD
+=======
+#include "prx/libSceAgcDriver/State/include/Configuration.hpp"
+>>>>>>> origin/main
 #include "prx/libSceAgcDriver/Execution/include/DisplayBuffer.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver.hpp"
 #include "prx/libSceAgcDriver/Execution/include/FrameCapture.hpp"
@@ -33,12 +37,17 @@
 #include <vector>
 #ifdef _WIN32
 #include <windows.h>
+<<<<<<< HEAD
 #else
 #include <sys/mman.h>
 #endif
 
 extern "C" int APS5_VABI sceAgcDriverSetTFRing(const volatile void* base, std::uint32_t size);
 
+=======
+#endif
+
+>>>>>>> origin/main
 namespace {
 
 using AgcDriver::FrameCall;
@@ -68,7 +77,10 @@ struct Options {
     std::chrono::milliseconds drainTimeout{10000};
     bool release = true;
     bool synthesize = true;
+<<<<<<< HEAD
     bool checkSubmits = false;
+=======
+>>>>>>> origin/main
 };
 
 class Frames {
@@ -194,6 +206,7 @@ void mapHostRanges(const FrameCaptureReader& reader, Skipped& skipped) {
         skipped.Add(*chunk);
     }
 #else
+<<<<<<< HEAD
     // Linux: host ranges (the title's own ELF data, host heaps the GPU reads) are mapped at their recorded addresses where this
     // process has nothing; a collision is skipped, or fails the replay for a GPU-visible range, as on Windows.
     constexpr std::uint64_t Granularity = 4096u;
@@ -219,6 +232,9 @@ void mapHostRanges(const FrameCaptureReader& reader, Skipped& skipped) {
         if ((chunk->access & FrameRangeAccess::Gpu) != 0) throw std::runtime_error("frame replay: cannot map the GPU-visible host range at " + std::to_string(chunk->address));
         skipped.Add(*chunk);
     }
+=======
+    for (const auto* chunk : host) skipped.Add(*chunk);
+>>>>>>> origin/main
 #endif
 }
 
@@ -235,6 +251,7 @@ Skipped restoreMemory(const FrameCaptureReader& reader) {
         for (const auto& chunk : reader.Chunks()) {
             if (chunk.kind != FrameMemoryKind::Range || chunk.rangeKind == FrameRangeKind::Host) continue;
             const bool gpu = (chunk.access & FrameRangeAccess::Gpu) != 0;
+<<<<<<< HEAD
 #ifndef _WIN32
             // The AGC driver's own 2 MiB block (Lifecycle.cpp MapDriverMemory, 0xfe0000000 in the system-reserved range) is mapped
             // with mmap outside the guest arena, so the arena refuses it here; this replay's driver maps and fills it itself.
@@ -243,6 +260,8 @@ Skipped restoreMemory(const FrameCaptureReader& reader) {
                 continue;
             }
 #endif
+=======
+>>>>>>> origin/main
             if (committedWritable(chunk.address, chunk.bytes)) {
                 if (!gpu) skipped.Add(chunk);
                 else std::memset(reinterpret_cast<void*>(static_cast<std::uintptr_t>(chunk.address)), 0, static_cast<std::size_t>(chunk.bytes));
@@ -302,8 +321,11 @@ struct Replay {
     std::atomic<std::uint64_t> earlyReleases{0};
     std::atomic<std::uint64_t> lateReleases{0};
     std::atomic<std::uint64_t> syntheticReleases{0};
+<<<<<<< HEAD
     std::atomic<std::uint64_t> zeroSubmits{0};
     std::atomic<std::uint64_t> badHeaderSubmits{0};
+=======
+>>>>>>> origin/main
     std::atomic<std::size_t> sequenced{0};
     std::uint64_t unfinished = 0;
     std::size_t threads = 0;
@@ -390,6 +412,7 @@ struct Replay {
             sceAgcDriverSetTFRing(reinterpret_cast<const volatile void*>(static_cast<std::uintptr_t>(call.address)), static_cast<std::uint32_t>(call.size));
             return;
         case FrameCallKind::Submit: {
+<<<<<<< HEAD
             const std::uint32_t* words = reinterpret_cast<const std::uint32_t*>(call.address);
             const std::uint32_t count = static_cast<std::uint32_t>(call.size);
             if (options.checkSubmits) {
@@ -411,6 +434,8 @@ struct Replay {
                     }
                 }
             }
+=======
+>>>>>>> origin/main
             const Packet packet{reinterpret_cast<std::uint32_t*>(static_cast<std::uintptr_t>(call.address)), static_cast<std::uint32_t>(call.size), static_cast<std::uint8_t>(call.flags), {}};
             if (call.queue == 0) sceAgcDriverSubmitDcb(&packet);
             else sceAgcDriverSubmitAcb(call.queue, &packet);
@@ -638,7 +663,10 @@ int usage() {
                          "  --release-after-ms  milliseconds without a completion before awaited dwords are released (3)\n"
                          "  --no-synthesize     releases a wait only with a value the capture recorded, never with its reference value\n"
                          "  --strict            fails on a pacing timeout or a failed registration inside the captured frames\n"
+<<<<<<< HEAD
                          "  --check-submits     reports zero-filled or malformed PM4 submissions in the JSON line\n"
+=======
+>>>>>>> origin/main
                          "  --dump              writes guest memory to a file after the replay (hexadecimal or decimal)\n"
                          "  --frames <dir>      writes each recorded and replayed display buffer as reference-<n>.bmp and replay-<n>.bmp\n");
     return 2;
@@ -754,14 +782,22 @@ int run(const Options& options) {
     std::sort(frameMs.begin(), frameMs.end());
     const auto percentile = [&](double fraction) { return frameMs.empty() ? 0.0 : frameMs[std::min(frameMs.size() - 1, static_cast<std::size_t>(fraction * static_cast<double>(frameMs.size())))]; };
     const auto seconds = std::chrono::duration<double>(replay.endedAt - replay.startedAt).count();
+<<<<<<< HEAD
     std::printf("{\"frames\":%zu,\"replay_s\":%.3f,\"fps\":%.3f,\"frame_ms\":{\"p50\":%.3f,\"p90\":%.3f,\"max\":%.3f,\"each\":[%s]},\"submits\":%llu,\"delta_mib\":%.1f,\"pace_timeouts\":%llu,\"pace_wait_s\":%.3f,\"stale_registrations\":%llu,\"failed_registrations\":%llu,\"skipped_mib\":%.1f,\"threads\":%zu,\"released_waits\":%llu,\"of_them_from_earlier_writes\":%llu,\"of_them_synthesized\":%llu,\"unfinished\":%llu,\"frames_compared\":%zu,\"pixels_identical\":%.6f,\"max_channel_diff\":%d,\"load_s\":%.3f,\"zero_submits\":%llu,\"bad_header_submits\":%llu}\n",
+=======
+    std::printf("{\"frames\":%zu,\"replay_s\":%.3f,\"fps\":%.3f,\"frame_ms\":{\"p50\":%.3f,\"p90\":%.3f,\"max\":%.3f,\"each\":[%s]},\"submits\":%llu,\"delta_mib\":%.1f,\"pace_timeouts\":%llu,\"pace_wait_s\":%.3f,\"stale_registrations\":%llu,\"failed_registrations\":%llu,\"skipped_mib\":%.1f,\"threads\":%zu,\"released_waits\":%llu,\"of_them_from_earlier_writes\":%llu,\"of_them_synthesized\":%llu,\"unfinished\":%llu,\"frames_compared\":%zu,\"pixels_identical\":%.6f,\"max_channel_diff\":%d,\"load_s\":%.3f}\n",
+>>>>>>> origin/main
                 ready.size(), seconds, seconds > 0 ? static_cast<double>(ready.size()) / seconds : 0.0, percentile(0.5), percentile(0.9), frameMs.empty() ? 0.0 : frameMs.back(), frameList.c_str(),
                 static_cast<unsigned long long>(replay.submits.load()), static_cast<double>(replay.deltaBytes.load()) / (1024.0 * 1024.0), static_cast<unsigned long long>(replay.paceTimeouts.load()),
                 replay.paceWaitedSeconds(), static_cast<unsigned long long>(replay.staleRegistrations.load()), static_cast<unsigned long long>(replay.failedRegistrations.load()),
                 static_cast<double>(replay.skipped.bytes) / (1024.0 * 1024.0), replay.threads, static_cast<unsigned long long>(replay.earlyReleases.load()), static_cast<unsigned long long>(replay.lateReleases.load()),
                 static_cast<unsigned long long>(replay.syntheticReleases.load()),
+<<<<<<< HEAD
                 static_cast<unsigned long long>(replay.unfinished), check.compared, check.identical, check.maxDifference, std::chrono::duration<double>(loaded - loadStart).count(),
                 static_cast<unsigned long long>(replay.zeroSubmits.load()), static_cast<unsigned long long>(replay.badHeaderSubmits.load()));
+=======
+                static_cast<unsigned long long>(replay.unfinished), check.compared, check.identical, check.maxDifference, std::chrono::duration<double>(loaded - loadStart).count());
+>>>>>>> origin/main
     std::fflush(stdout);
     return replay.unfinished == 0 ? 0 : 3;
 }
@@ -777,7 +813,10 @@ int main(int argc, char** argv) {
         else if (argument == "--no-synthesize") options.synthesize = false;
         else if (argument == "--release-after-ms" && index + 1 < argc) options.releaseAfter = std::chrono::milliseconds(std::strtoll(argv[++index], nullptr, 10));
         else if (argument == "--strict") options.strict = true;
+<<<<<<< HEAD
         else if (argument == "--check-submits") options.checkSubmits = true;
+=======
+>>>>>>> origin/main
         else if (argument == "--dump" && index + 1 < argc) options.dumps.push_back(parseDump(argv[++index]));
         else if (argument == "--frames" && index + 1 < argc) options.frames = argv[++index];
         else if (!argument.starts_with("-") && options.directory.empty()) options.directory = argument;

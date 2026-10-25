@@ -1,3 +1,7 @@
+<<<<<<< HEAD
+=======
+#include "prx/libSceAgc/DcbFlow/include/Memory.hpp"
+>>>>>>> origin/main
 #include "prx/libSceAgcDriver/Execution/include/Driver.hpp"
 #include "prx/libSceAgcDriver/Execution/include/FrameCapture.hpp"
 #include "prx/libSceAgcDriver/Execution/include/VideoOutput.hpp"
@@ -21,11 +25,14 @@
 #include <windows.h>
 #endif
 
+<<<<<<< HEAD
 extern "C" {
 std::uint32_t* APS5_VABI sceAgcDcbWriteData(CommandBuffer*, std::uint8_t, std::uint8_t, std::uint64_t, const void*, std::uint32_t, std::uint8_t, std::uint8_t);
 std::uint32_t* APS5_VABI sceAgcDcbDmaData(CommandBuffer*, std::uint8_t, std::uint8_t, std::uint8_t, std::uint64_t, std::uint8_t, std::uint8_t, std::uint64_t, std::uint32_t, std::uint8_t, std::uint8_t, std::uint8_t);
 }
 
+=======
+>>>>>>> origin/main
 namespace {
 
 using AgcDriver::FrameCallKind;
