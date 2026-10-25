@@ -1948,6 +1948,10 @@ struct ReusedTableElement {
     bool firstLayer = false;
     bool rejected = false;
     std::string message;
+    std::weak_ptr<const StorageTexture> source;
+    std::uint64_t sourceVersion = 0;
+    std::uint64_t sourceWrites = 0;
+    bool hasSource = false;
 };
 
 struct ReusedTable {
@@ -1989,7 +1993,8 @@ enum TableProbeCount : std::size_t {
     TpDropEpoch, TpDropUnwatch, TpDropAllocations, TpDropDepth,
     TpResolved, TpElements, TpResolveUs, TpBuildsWithTables,
     TpNotKeptCapacity, TpNotKeptStored, TpNotKeptNoBinding, TpNotKeptLookup, TpNotKeptSource, TpNotKeptUnwatched, TpNotKeptDcc,
-    TpMovedEpoch, TpMovedUnwatch, TpMovedAllocations, TpMovedDepth, TpPendingAtSave, TpKept, TpEvicted, TableProbeCounts
+    TpMovedEpoch, TpMovedUnwatch, TpMovedAllocations, TpMovedDepth, TpPendingAtSave, TpKept, TpEvicted,
+    TpKeptSource, TpSourceWritten, TpSourceGone, TableProbeCounts
 };
 std::array<std::atomic<std::uint64_t>, TableProbeCounts> tableProbeCounts{};
 std::atomic<std::uint64_t> tableProbeMaxElements{0};
@@ -1998,6 +2003,11 @@ std::atomic<std::int64_t> tableProbeReportedAt{0};
 bool TableProbeOn() {
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
     return profile;
+}
+
+bool TableReuseStorageSources() {
+    static const bool enabled = std::getenv("APS5_TABLE_REUSE_STORAGE_SOURCES") != nullptr;
+    return enabled;
 }
 
 void countTableProbe(TableProbeCount what, std::uint64_t amount = 1) {
@@ -2023,12 +2033,13 @@ void reportTableProbe() {
     for (std::size_t i = 0; i < TableProbeCounts; ++i) c[i] = static_cast<unsigned long long>(tableProbeCounts[i].exchange(0, std::memory_order_relaxed));
     const auto maxElements = static_cast<unsigned long long>(tableProbeMaxElements.exchange(0, std::memory_order_relaxed));
     const double resolved = c[TpResolved] != 0 ? static_cast<double>(c[TpResolved]) : 1.0;
-    AgcDriver::ProfilePrint_nid_no_patch("[table-reuse] (10 s): lookups %llu: disabled %llu, skipped %llu, none saved %llu, all dropped by state %llu, words differ %llu, not current %llu, textures not cached %llu, reused %llu; saved tables dropped by state: epoch %llu, unwatch %llu, allocations %llu, depth %llu; resolved %llu (elements avg %.0f max %llu, %.0f us avg), builds with tables %llu; not kept: capacity %llu, stored element %llu, no binding %llu, lookup not exact %llu, snapshot source %llu, unwatched lookup %llu, DCC %llu; state moved during the resolve: epoch %llu, unwatch %llu, allocations %llu, depth %llu; pending at save %llu; kept %llu; evicted %llu\n",
+    AgcDriver::ProfilePrint_nid_no_patch("[table-reuse] (10 s): lookups %llu: disabled %llu, skipped %llu, none saved %llu, all dropped by state %llu, words differ %llu, not current %llu, textures not cached %llu, reused %llu; saved tables dropped by state: epoch %llu, unwatch %llu, allocations %llu, depth %llu; resolved %llu (elements avg %.0f max %llu, %.0f us avg), builds with tables %llu; not kept: capacity %llu, stored element %llu, no binding %llu, lookup not exact %llu, snapshot source %llu, unwatched lookup %llu, DCC %llu; state moved during the resolve: epoch %llu, unwatch %llu, allocations %llu, depth %llu; pending at save %llu; kept %llu; evicted %llu; storage sources: kept %llu, source written %llu, source gone %llu\n",
         c[TpLookups], c[TpDisabled], c[TpSkipped], c[TpNoneSaved], c[TpAllDropped], c[TpWordsDiffer], c[TpNotCurrent], c[TpNotCached], c[TpReused],
         c[TpDropEpoch], c[TpDropUnwatch], c[TpDropAllocations], c[TpDropDepth],
         c[TpResolved], static_cast<double>(c[TpElements]) / resolved, maxElements, static_cast<double>(c[TpResolveUs]) / resolved, c[TpBuildsWithTables],
         c[TpNotKeptCapacity], c[TpNotKeptStored], c[TpNotKeptNoBinding], c[TpNotKeptLookup], c[TpNotKeptSource], c[TpNotKeptUnwatched], c[TpNotKeptDcc],
-        c[TpMovedEpoch], c[TpMovedUnwatch], c[TpMovedAllocations], c[TpMovedDepth], c[TpPendingAtSave], c[TpKept], c[TpEvicted]);
+        c[TpMovedEpoch], c[TpMovedUnwatch], c[TpMovedAllocations], c[TpMovedDepth], c[TpPendingAtSave], c[TpKept], c[TpEvicted],
+        c[TpKeptSource], c[TpSourceWritten], c[TpSourceGone]);
 }
 
 // probed: the [table-reuse] lookup outcomes count resolveImageTables' lookups only; drops count from every caller.
@@ -2057,6 +2068,18 @@ bool TableCurrent(ReusedTable& table) {
     if (serial != table.pendingSerial) {
         if (StorageTexture::AnyPendingOverlaps(table.ranges) || StorageTexture::PendingSerial() != serial) return false;
         table.pendingSerial = serial;
+    }
+    for (const auto& element : table.elements) {
+        if (!element.hasSource) continue;
+        const auto source = element.source.lock();
+        if (source == nullptr) {
+            if (TableProbeOn()) countTableProbe(TpSourceGone);
+            return false;
+        }
+        if (source->Version() != element.sourceVersion || source->Writes() != element.sourceWrites) {
+            if (TableProbeOn()) countTableProbe(TpSourceWritten);
+            return false;
+        }
     }
     return GuestMemory::UnchangedSinceAll(table.queries);
 }
@@ -5473,13 +5496,22 @@ void ShaderResources::resolveImageTables() {
                 const auto& log = lookupLog();
                 const auto* looked = log.empty() ? nullptr : &log.back();
                 if (looked == nullptr || looked->object != texture.get()) dropReuse(TpNotKeptLookup);
-                else if (looked->source != nullptr) dropReuse(TpNotKeptSource);
-                else if (looked->generation == 0) dropReuse(TpNotKeptUnwatched);
+                else if (looked->source != nullptr && !(TableReuseStorageSources() && !texture->IsDepthCopy() && looked->keys == DccKeys::Uncompressed && resource.dccAddress == 0)) dropReuse(TpNotKeptSource);
+                else if (looked->source == nullptr && looked->generation == 0) dropReuse(TpNotKeptUnwatched);
                 else if (looked->keys != DccKeys::Uncompressed || resource.dccAddress != 0) dropReuse(TpNotKeptDcc);
                 if (reusable) {
                     fresh.elements.push_back({MakeTextureKey(context.device, sampledWords, components, depthCompare), texture, resource, guestBytes, firstLayer, false, {}});
-                    fresh.queries.push_back({resource.baseAddress, static_cast<std::size_t>(guestBytes), looked->generation});
-                    fresh.ranges.emplace_back(resource.baseAddress, resource.baseAddress + guestBytes);
+                    if (looked->source != nullptr) {
+                        auto& kept = fresh.elements.back();
+                        kept.source = looked->source->weak_from_this();
+                        kept.sourceVersion = looked->source->Version();
+                        kept.sourceWrites = looked->source->Writes();
+                        kept.hasSource = true;
+                        if (TableProbeOn()) countTableProbe(TpKeptSource);
+                    } else {
+                        fresh.queries.push_back({resource.baseAddress, static_cast<std::size_t>(guestBytes), looked->generation});
+                        fresh.ranges.emplace_back(resource.baseAddress, resource.baseAddress + guestBytes);
+                    }
                 }
             }
             fresh.bound[element] = bind(element, sampledWords, std::move(texture), resource, guestBytes, firstLayer);
