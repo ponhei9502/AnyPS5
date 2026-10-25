@@ -51,13 +51,7 @@ private:
     Pad::KeyboardMouse keyboardMouse;
     std::array<ControllerSlot, PAD_MAX_CONTROLLERS> slots{};
     VideoOutTelemetry::PadChangeFilter telemetryFilter;
-<<<<<<< HEAD
-    std::chrono::steady_clock::time_point nextRumbleRefresh{};
-    LightBarPacer lightBar;
-    TriggerEffectCache triggerEffect;
     std::uint32_t padScriptButtons = 0;
-=======
->>>>>>> origin/main
 };
 
 #endif

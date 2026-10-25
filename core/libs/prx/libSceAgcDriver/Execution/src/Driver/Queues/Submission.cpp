@@ -96,16 +96,6 @@ bool EopRelease(std::span<const std::uint32_t> words) {
 
 }
 
-<<<<<<< HEAD
-std::uint64_t& flipSubmissionsOfThread() {
-    struct FlipSubmissionsStorage {};
-    return HostThreadLocal<std::uint64_t, FlipSubmissionsStorage>();
-}
-
-}
-
-=======
->>>>>>> origin/main
 std::uint64_t Driver::FlipSubmissions() const {
     return flipSubmissionsOfThread();
 }

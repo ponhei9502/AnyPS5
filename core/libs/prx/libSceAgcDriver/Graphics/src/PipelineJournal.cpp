@@ -25,10 +25,6 @@
 #else
 #include <fcntl.h>
 #include <sys/file.h>
-<<<<<<< HEAD
-#include <sys/mman.h>
-=======
->>>>>>> origin/main
 #include <sys/stat.h>
 #include <unistd.h>
 #endif
@@ -781,11 +777,6 @@ public:
         LoadedJournal loaded;
         if (!Enabled() || !bound.load(std::memory_order_acquire)) return loaded;
         const auto started = std::chrono::steady_clock::now();
-<<<<<<< HEAD
-        static const bool mmapJournal = std::getenv("APS5_PIPELINE_JOURNAL_MMAP") != nullptr;
-        auto file = std::make_shared<std::vector<std::byte>>();
-=======
->>>>>>> origin/main
         bool read = false;
         bool mapped = false;
 #ifndef _WIN32
@@ -793,26 +784,10 @@ public:
 #endif
         {
             FileLock fileLock(lockPath);
-<<<<<<< HEAD
-#ifndef _WIN32
-            if (mmapJournal) {
-                mapping = mapJournal(path);
-                if (mapping) {
-                    parse(std::span<const std::byte>(mapping->data, mapping->size), mapping, loaded, true);
-                    read = true;
-                    mapped = true;
-                }
-            }
-#endif
-            if (!read) read = ShaderRecompiler::ReadWholeFile(path, *file);
-        }
-        if (!mapped && read) parse(std::span<const std::byte>(*file), file, loaded, true);
-=======
             auto file = std::make_shared<const JournalFile>(path);
             read = file->Open() && parse(*file, loaded, true);
             if (read) loaded.file = std::move(file);
         }
->>>>>>> origin/main
         const auto ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - started).count();
         {
             std::lock_guard lock(mutex);
@@ -932,20 +907,12 @@ private:
     // Parses the file: with `loaded` set every record is decoded, otherwise only the index (the
     // module identities and record hashes) is built. Stops at the first record that does not
     // parse; the bytes before it stay valid.
-<<<<<<< HEAD
-    void parse(std::span<const std::byte> bytes, const std::shared_ptr<const void>& owner, LoadedJournal& loaded, bool decode) {
-        std::uint64_t valid = 0;
-        bool header = false;
-        std::uint64_t dropped = 0;
-        if (bytes.size() >= sizeof(FileHeader)) {
-=======
     bool parse(const JournalFile& file, LoadedJournal& loaded, bool decode, std::vector<RecordSpan>* spans = nullptr) {
         std::uint64_t valid = 0;
         bool header = false;
         std::uint64_t dropped = 0;
         const auto size = file.Size();
         if (size >= sizeof(FileHeader)) {
->>>>>>> origin/main
             FileHeader fileHeader;
             if (!file.ReadValue(0, fileHeader)) return false;
             header = fileHeader.magic == FileMagic && fileHeader.format == FileFormat && fileHeader.runtimeAbi == ShaderRecompiler::RuntimeAbi::Version && fileHeader.sourceVersion == ShaderRecompiler::ShaderDiskCache::SourceVersion() && fileHeader.device == device.load(std::memory_order_relaxed);
@@ -1052,16 +1019,10 @@ private:
     bool indexLocked() {
         LoadedJournal index;
         std::error_code error;
-<<<<<<< HEAD
-        const bool exists = std::filesystem::exists(path, error);
-        if (exists && !ShaderRecompiler::ReadWholeFile(path, file)) return false;
-        if (exists) parse(std::span<const std::byte>(file), nullptr, index, false);
-=======
         if (std::filesystem::exists(path, error)) {
             const JournalFile file(path);
             if (!file.Open() || !parse(file, index, false)) return false;
         }
->>>>>>> origin/main
         std::lock_guard lock(mutex);
         indexed = true;
         validBytes = index.validBytes;

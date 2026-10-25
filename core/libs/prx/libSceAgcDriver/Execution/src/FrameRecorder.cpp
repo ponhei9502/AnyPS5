@@ -1,7 +1,4 @@
-<<<<<<< HEAD
-=======
 #include "prx/libSceAgcDriver/State/include/Configuration.hpp"
->>>>>>> origin/main
 #include "prx/libSceAgcDriver/Execution/include/FrameRecorder.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
@@ -26,18 +23,10 @@
 #ifdef _WIN32
 #include <windows.h>
 #else
-<<<<<<< HEAD
 #include <sys/mman.h>
 #include <unistd.h>
 #endif
 
-extern "C" int APS5_VABI sceAgcDriverGetTFRing(uintptr_t* base, uint32_t* size);
-
-=======
-#include <unistd.h>
-#endif
-
->>>>>>> origin/main
 namespace AgcDriver {
 namespace {
 
@@ -106,7 +95,6 @@ std::uint64_t contentHash(std::span<const std::byte> bytes) {
     return hash == 0 ? 1 : hash;
 }
 
-<<<<<<< HEAD
 // B71d-d: same check as Driver::RegisterShader
 bool shaderHeaderValid(std::uint64_t address) {
     if (!GuestMemory::Accessible(reinterpret_cast<const void*>(address), sizeof(Shader))) return false;
@@ -115,8 +103,6 @@ bool shaderHeaderValid(std::uint64_t address) {
     return fields.file_header == 0x34333231u && fields.version == 0x18u;
 }
 
-=======
->>>>>>> origin/main
 }
 
 FrameRecorder* FrameRecorder::Active() {
@@ -302,12 +288,8 @@ bool FrameRecorder::triggered() {
 void FrameRecorder::emitDelta() {
     std::vector<Span> spans;
     for (const auto& range : ranges) {
-<<<<<<< HEAD
         // Section (memfd direct memory) is write-watched on Linux; B71d.
         if (range.kind == FrameRangeKind::Watched || range.kind == FrameRangeKind::Unwatched || range.kind == FrameRangeKind::Section) spans.push_back({range.address, range.bytes, generation});
-=======
-        if (range.kind == FrameRangeKind::Watched || range.kind == FrameRangeKind::Unwatched) spans.push_back({range.address, range.bytes, generation});
->>>>>>> origin/main
     }
     const auto mark = GuestMemory::WriteGeneration();
     const auto added = newRanges();
@@ -337,10 +319,7 @@ std::vector<FrameRecorder::Range> FrameRecorder::newRanges() {
             auto piece = range;
             piece.address = at;
             piece.bytes = (next == covered.end() ? end : std::min(end, next->first)) - at;
-<<<<<<< HEAD
             if (piece.inode != 0) piece.fileOffset += at - range.address;
-=======
->>>>>>> origin/main
             added.push_back(piece);
             at += piece.bytes;
         }
@@ -436,10 +415,7 @@ void FrameRecorder::writeDelta(std::span<const Span> spans, std::span<const std:
             GuestMemory::ReadCommittedUnsynced(begin, bytes);
             writer->WriteDelta(group, completed, begin, bytes);
             deltaBytes += bytes.size();
-<<<<<<< HEAD
             writeAliases(group, completed, begin, end, bytes);
-=======
->>>>>>> origin/main
             any = true;
         }
     }
@@ -453,7 +429,6 @@ void FrameRecorder::writeDelta(std::span<const Span> spans, std::span<const std:
     writer->WriteCall(call);
 }
 
-<<<<<<< HEAD
 void FrameRecorder::writeAliases(std::uint64_t group, std::uint64_t completed, std::uint64_t begin, std::uint64_t end, std::vector<std::byte>& scratch) {
     const Range* owner = nullptr;
     for (const auto& range : ranges) {
@@ -478,8 +453,6 @@ void FrameRecorder::writeAliases(std::uint64_t group, std::uint64_t completed, s
     }
 }
 
-=======
->>>>>>> origin/main
 void FrameRecorder::snapshot(const Range& range) {
     writer->WriteRange(range.address, range.bytes, range.kind, range.protection, range.access);
     if (!range.readable) {
@@ -529,19 +502,14 @@ void FrameRecorder::start() {
     writer = std::make_unique<FrameCaptureWriter>(directory);
     std::vector<std::pair<std::uint64_t, std::uint64_t>> written;
     for (const auto& range : ranges) {
-<<<<<<< HEAD
         // Section (memfd direct memory) is write-watched on Linux; B71d.
         if (range.kind == FrameRangeKind::Watched || range.kind == FrameRangeKind::Unwatched || range.kind == FrameRangeKind::Section) GuestMemory::CollectWrittenBlocks(range.address, static_cast<std::size_t>(range.bytes), std::numeric_limits<std::uint64_t>::max(), written);
-=======
-        if (range.kind == FrameRangeKind::Watched || range.kind == FrameRangeKind::Unwatched) GuestMemory::CollectWrittenBlocks(range.address, static_cast<std::size_t>(range.bytes), std::numeric_limits<std::uint64_t>::max(), written);
->>>>>>> origin/main
     }
     generation = GuestMemory::WriteGeneration();
     for (const auto& range : ranges) {
         snapshot(range);
         if (!writer) return;
     }
-<<<<<<< HEAD
     std::uint64_t droppedPrologue = 0;
     for (const auto& call : prologue) {
         bool keep = true;
@@ -568,9 +536,6 @@ void FrameRecorder::start() {
         warnings.push_back("dropped " + std::to_string(droppedPrologue) + " prologue shader calls whose header was invalid at capture start");
         std::fprintf(stderr, "[frame-capture] B71d-d: dropped %llu stale prologue shader calls\n", static_cast<unsigned long long>(droppedPrologue));
     }
-=======
-    for (const auto& call : prologue) writer->WriteCall(call);
->>>>>>> origin/main
     std::uintptr_t ringBase = 0;
     std::uint32_t ringSize = 0;
     sceAgcDriverGetTFRing(&ringBase, &ringSize);
@@ -604,15 +569,9 @@ void FrameRecorder::finish() {
     writer->WriteCall(end);
     writeReferenceFrames();
     writer->Finish(header());
-<<<<<<< HEAD
     std::fprintf(stderr, "[frame-capture] %llu frames, %llu calls, %llu memory deltas (%.1f MiB), alias deltas %.1f MiB, %.1f MiB raw, %.1f MiB stored in %s\n", static_cast<unsigned long long>(recordedFrames),
                  static_cast<unsigned long long>(recordedCalls), static_cast<unsigned long long>(deltaGroups), static_cast<double>(deltaBytes) / (1024.0 * 1024.0),
                  static_cast<double>(aliasBytes) / (1024.0 * 1024.0), static_cast<double>(writer->RawBytes()) / (1024.0 * 1024.0), static_cast<double>(writer->StoredBytes()) / (1024.0 * 1024.0), directory.string().c_str());
-=======
-    std::fprintf(stderr, "[frame-capture] %llu frames, %llu calls, %llu memory deltas (%.1f MiB), %.1f MiB raw, %.1f MiB stored in %s\n", static_cast<unsigned long long>(recordedFrames),
-                 static_cast<unsigned long long>(recordedCalls), static_cast<unsigned long long>(deltaGroups), static_cast<double>(deltaBytes) / (1024.0 * 1024.0),
-                 static_cast<double>(writer->RawBytes()) / (1024.0 * 1024.0), static_cast<double>(writer->StoredBytes()) / (1024.0 * 1024.0), directory.string().c_str());
->>>>>>> origin/main
     writer.reset();
     state = State::Done;
 }
@@ -628,11 +587,7 @@ std::string FrameRecorder::header() const {
     text += ",\"start_boundary\":" + std::to_string(startBoundary) + ",\"frames\":" + std::to_string(recordedFrames);
     text += ",\"calls\":" + std::to_string(recordedCalls) + ",\"prologue_calls\":" + std::to_string(prologue.size());
     text += ",\"ranges\":" + std::to_string(ranges.size()) + ",\"late_ranges\":" + std::to_string(lateRanges) + ",\"snapshot_bytes\":" + std::to_string(snapshotBytes) + ",\"unreadable_bytes\":" + std::to_string(unreadableBytes);
-<<<<<<< HEAD
     text += ",\"memory_groups\":" + std::to_string(deltaGroups) + ",\"delta_bytes\":" + std::to_string(deltaBytes) + ",\"alias_bytes\":" + std::to_string(aliasBytes);
-=======
-    text += ",\"memory_groups\":" + std::to_string(deltaGroups) + ",\"delta_bytes\":" + std::to_string(deltaBytes);
->>>>>>> origin/main
     text += ",\"capture_seconds\":" + std::to_string(std::chrono::duration<double>(std::chrono::steady_clock::now() - startedAt).count());
     text += ",\"env\":{";
     bool first = true;
@@ -678,11 +633,7 @@ std::vector<FrameRecorder::Range> FrameRecorder::committedRanges() {
                 else if (info.Type == MEM_PRIVATE) range.kind = GuestMemory::Watched(range.address, static_cast<std::size_t>(range.bytes)) ? FrameRangeKind::Watched : FrameRangeKind::Unwatched;
                 else range.kind = FrameRangeKind::Section;
                 auto& last = result.empty() ? range : result.back();
-<<<<<<< HEAD
                 if (!result.empty() && last.address + last.bytes == range.address && last.kind == range.kind && last.protection == range.protection && last.readable == range.readable && last.access == range.access && last.inode == range.inode && (range.inode == 0 || last.fileOffset + last.bytes == range.fileOffset)) last.bytes += range.bytes;
-=======
-                if (!result.empty() && last.address + last.bytes == range.address && last.kind == range.kind && last.protection == range.protection && last.readable == range.readable && last.access == range.access) last.bytes += range.bytes;
->>>>>>> origin/main
                 else result.push_back(range);
             }
             address = regionEnd;
@@ -690,7 +641,6 @@ std::vector<FrameRecorder::Range> FrameRecorder::committedRanges() {
     }
     return result;
 #else
-<<<<<<< HEAD
     // Linux: the same ranges from /proc/self/maps. An unmapped gap is not committed. Guest direct memory is a shared memfd mapping
     // (Section, as a Windows section view); other shared mappings are Section, file-backed ones File; private anonymous memory is
     // Watched or Unwatched as on Windows. protection holds PROT_* bits.
@@ -767,9 +717,6 @@ std::vector<FrameRecorder::Range> FrameRecorder::committedRanges() {
         }
     }
     return result;
-=======
-    throw std::runtime_error("frame capture: guest memory capture is implemented on Windows only");
->>>>>>> origin/main
 #endif
 }
 

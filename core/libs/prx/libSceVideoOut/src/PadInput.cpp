@@ -111,12 +111,8 @@ PadInput::PadInput() : PadInput(Pad::LoadInputMapping()) {
 }
 
 PadInput::PadInput(Pad::InputConfiguration configuration) : keyboardMouse(std::move(configuration)) {
-<<<<<<< HEAD
     static_cast<void>(ScriptedButtons());
-    openFirstAvailableController();
-=======
     openAvailableControllers();
->>>>>>> origin/main
 }
 
 PadInput::~PadInput() {
@@ -412,22 +408,6 @@ void PadInput::Update(const DisplayWindow& window) {
         return;
     }
     const bool changed = keyboardMouse.Advance(std::chrono::steady_clock::now());
-<<<<<<< HEAD
-    if (controller != nullptr || keyboardMouse.MouseMode() || changed) publish(window.FrameNumber());
-    // Scripted/Commanded pad presses are read in ScriptedButtons(); without a controller nothing else
-    // calls publish(), so poll them on every update and publish when the scripted state changes.
-    const auto scripted = ScriptedButtons();
-    const bool scriptChanged = scripted != padScriptButtons;
-    padScriptButtons = scripted;
-    if (scriptChanged || (!controller && std::getenv("APS5_INPUT_SCRIPT") != nullptr)) publish(window.FrameNumber());
-}
-
-void PadInput::publish(std::uint64_t frame) {
-    auto state = keyboardMouse.Compose(controllerState);
-    state.buttons |= ScriptedButtons();
-    PadPublishInput_nid_postfix(state);
-    if (auto* telemetry = VideoOutTelemetry::Instance(); telemetry != nullptr) VideoOutTelemetry::EmitPadIfChanged(*telemetry, telemetryFilter, frame, state);
-=======
     if (slots[0].controller != nullptr || keyboardMouse.MouseMode() || changed) {
         publish(window.FrameNumber(), 0);
     }
@@ -436,6 +416,12 @@ void PadInput::publish(std::uint64_t frame) {
             publish(window.FrameNumber(), slot);
         }
     }
+    // Scripted/Commanded pad presses are read in ScriptedButtons(); without a controller nothing else
+    // calls publish(), so poll them on every update and publish slot 0 when the scripted state changes.
+    const auto scripted = ScriptedButtons();
+    const bool scriptChanged = scripted != padScriptButtons;
+    padScriptButtons = scripted;
+    if (scriptChanged || (slots[0].controller == nullptr && std::getenv("APS5_INPUT_SCRIPT") != nullptr)) publish(window.FrameNumber(), 0);
 }
 
 void PadInput::publish(std::uint64_t frame) {
@@ -447,11 +433,11 @@ void PadInput::publish(std::uint64_t frame) {
 void PadInput::publish(std::uint64_t frame, int slot) {
     if (slot < 0 || slot >= PAD_MAX_CONTROLLERS) return;
     if (slot == 0) {
-        const auto state = keyboardMouse.Compose(slots[0].state);
+        auto state = keyboardMouse.Compose(slots[0].state);
+        state.buttons |= ScriptedButtons();
         PadPublishInput_nid_postfix(state);
         if (auto* telemetry = VideoOutTelemetry::Instance(); telemetry != nullptr) VideoOutTelemetry::EmitPadIfChanged(*telemetry, telemetryFilter, frame, state);
     } else {
         PadPublishInputForPort_nid_postfix(slot, slots[slot].state);
     }
->>>>>>> origin/main
 }

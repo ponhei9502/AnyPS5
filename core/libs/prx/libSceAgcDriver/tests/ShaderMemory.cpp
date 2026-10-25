@@ -1806,7 +1806,6 @@ std::array<std::uint32_t, 8> TableSelected(const ShaderRecompiler::ImageTableSna
     return column.words.at(column.codes[0]).dwords;
 }
 
-<<<<<<< HEAD
 // B59a (10-25): with APS5_SPECIALIZED_MODULE_CACHE_MIB=1b every new specialized module evicts the others. A module rebuilt after
 // its eviction must keep its specializationId (so PipelineVariantId and the Vulkan pipeline stay the same) and its SPIR-V.
 // Run only through --specialized-module-cache, which sets the switches before the first lookup.
@@ -1832,7 +1831,8 @@ void verifySpecializedModuleCacheEviction() {
     require(a.variantId != b.variantId || a.specializationId != b.specializationId, "specialized module cache: the two shaders share one module (no eviction happens)");
     require(a.PipelineVariantId() == c.PipelineVariantId() && a.specializationId == c.specializationId, "specialized module cache: a module rebuilt after its eviction got a new pipeline id");
     require(a.spirv == c.spirv, "specialized module cache: the rebuilt module's SPIR-V differs");
-=======
+}
+
 void verifyTargetFeatureKey() {
     using namespace ShaderRecompiler;
     static constexpr std::array<std::uint32_t, 1> code{0xbf810000u};
@@ -1866,7 +1866,6 @@ void verifyTargetFeatureKey() {
     for (std::uint32_t index = 0; index < 40u; ++index) many.push_back("SPV_EXT_descriptor_indexing_" + std::to_string(index));
     const std::vector<std::string_view> manyViews(many.begin(), many.end());
     require(build(capabilities, manyViews).size() == base.size(), "target feature key: the key grows with the device's extension names");
->>>>>>> origin/main
 }
 
 void verifyImageTableKeys() {
