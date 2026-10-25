@@ -168,6 +168,21 @@ void traceSubmit(const FrameCall& call) {
     const auto* words = reinterpret_cast<const std::uint32_t*>(static_cast<std::uintptr_t>(call.address));
     const auto count = static_cast<std::uint32_t>(call.size);
     const auto address = [](std::uint32_t low, std::uint32_t high) { return (static_cast<std::uint64_t>(high) << 32) | (low & ~3u); };
+    static const char* listCall = std::getenv("APS5_DRY_LIST_CALL");
+    if (listCall != nullptr && std::strtoull(listCall, nullptr, 10) == call.ordinal) {
+        const auto from = static_cast<std::uint32_t>(std::strtoul(std::getenv("APS5_DRY_LIST_FROM") ? std::getenv("APS5_DRY_LIST_FROM") : "0", nullptr, 10));
+        const auto to = static_cast<std::uint32_t>(std::strtoul(std::getenv("APS5_DRY_LIST_TO") ? std::getenv("APS5_DRY_LIST_TO") : "0", nullptr, 10));
+        for (std::uint32_t i = 0; i < count && i < to;) {
+            const auto header = words[i];
+            const auto length = (header >> 30) == 3 ? 2 + ((header >> 16) & 0x3fff) : 1;
+            if (i >= from) {
+                std::fprintf(stderr, "[list] dword %u header 0x%08x opcode 0x%x len %u:", i, header, (header >> 8) & 0xff, length);
+                for (std::uint32_t k = 1; k < length && k < 12 && i + k < count; ++k) std::fprintf(stderr, " %08x", words[i + k]);
+                std::fprintf(stderr, "\n");
+            }
+            i += length;
+        }
+    }
     for (std::uint32_t i = 0; i < count;) {
         const auto header = words[i];
         if (header == 0 || (header >> 30) != 3) { ++i; continue; }
@@ -553,6 +568,7 @@ struct Replay {
             if (cut) {
                 std::fprintf(stderr, "[probe] cut call %llu at command %u (dword %u of %llu)\n", static_cast<unsigned long long>(call.ordinal), options.cutCommand, size, static_cast<unsigned long long>(call.size));
                 probeAfterSubmit(call, true);
+                dumpInputs(call);
                 std::fflush(stderr);
                 std::_Exit(0);
             }
@@ -659,6 +675,92 @@ struct Replay {
             std::fprintf(stderr, "[frame-replay] stall: wait at 0x%llx bytes %u function %u mask 0x%llx reference 0x%llx now 0x%llx (%s)\n", static_cast<unsigned long long>(wait.address),
                          static_cast<unsigned>(wait.bytes), static_cast<unsigned>(wait.function), static_cast<unsigned long long>(wait.mask), static_cast<unsigned long long>(wait.reference),
                          static_cast<unsigned long long>(load(wait.address, bytes)), where);
+        }
+    }
+
+    // B71d probe: bytes of a guest range as the capture had them (start snapshot only, or snapshot plus every delta recorded before `before`).
+    std::vector<std::byte> capturedBytes(std::uint64_t address, std::uint64_t bytes, bool withDeltas, std::uint64_t before) {
+        std::vector<std::byte> result(static_cast<std::size_t>(bytes));
+        const auto overlay = [&](const FrameMemoryChunk& chunk) {
+            if (chunk.address >= address + bytes || chunk.address + chunk.bytes <= address) return;
+            const auto data = reader.Read(chunk);
+            const auto from = std::max(address, chunk.address);
+            const auto to = std::min(address + bytes, chunk.address + chunk.bytes);
+            std::memcpy(result.data() + (from - address), data.data() + (from - chunk.address), static_cast<std::size_t>(to - from));
+        };
+        for (const auto& chunk : reader.Chunks()) if (chunk.kind == FrameMemoryKind::Snapshot) overlay(chunk);
+        if (withDeltas) {
+            for (const auto& recorded : reader.Calls()) {
+                if (recorded.ordinal >= before) break;
+                if (recorded.kind != FrameCallKind::Memory) continue;
+                const auto found = groups.find(recorded.values.at(0));
+                if (found == groups.end()) continue;
+                for (const auto* chunk : found->second) overlay(*chunk);
+            }
+        }
+        return result;
+    }
+
+    void dumpInputs(const FrameCall& call) {
+        const char* path = std::getenv("APS5_CUT_DUMP_FILE");
+        if (path == nullptr) return;
+        std::ifstream file(path);
+        std::string a, b, label;
+        const auto hash = [](const std::vector<std::byte>& v) { std::uint64_t h = 0xcbf29ce484222325ull; for (auto x : v) h = (h ^ static_cast<std::uint64_t>(x)) * 0x100000001b3ull; return h; };
+        const auto hex = [](const std::vector<std::byte>& v) { std::string t; char c[4]; for (std::size_t i = 0; i < std::min<std::size_t>(16, v.size()); ++i) { std::snprintf(c, sizeof(c), "%02x", static_cast<unsigned>(v[i])); t += c; } return t; };
+        while (file >> a >> b >> label) {
+            const auto address = std::strtoull(a.c_str(), nullptr, 0);
+            const auto bytes = std::min<std::uint64_t>(std::strtoull(b.c_str(), nullptr, 0), 8ull << 20);
+            try {
+                auto* const pointer = reinterpret_cast<const std::byte*>(static_cast<std::uintptr_t>(address));
+                GuestArena::GuestArenaPrepareHostRead_nid_no_patch(pointer, static_cast<std::size_t>(bytes));
+                const std::vector<std::byte> now(pointer, pointer + bytes);
+                if (label.size() > 4 && label.ends_with(".bin") && std::getenv("APS5_CUT_DUMP_DIR") != nullptr) {
+                    std::ofstream out(std::filesystem::path(std::getenv("APS5_CUT_DUMP_DIR")) / label, std::ios::binary);
+                    out.write(reinterpret_cast<const char*>(now.data()), static_cast<std::streamsize>(now.size()));
+                }
+                const auto snapshot = capturedBytes(address, bytes, false, 0);
+                const auto recorded = capturedBytes(address, bytes, true, call.ordinal);
+                if (const char* later = std::getenv("APS5_CUT_DUMP_LATER")) {   // how many words equal the capture's value at a later call (e.g. the next frame)
+                    std::uint64_t equalLater = 0, differsRecorded = 0;
+                    const auto laterBytes = capturedBytes(address, bytes, true, std::strtoull(later, nullptr, 10));
+                    for (std::size_t i = 0; i + 4 <= now.size(); i += 4) {
+                        if (std::memcmp(now.data() + i, recorded.data() + i, 4) == 0) continue;
+                        ++differsRecorded;
+                        equalLater += std::memcmp(now.data() + i, laterBytes.data() + i, 4) == 0;
+                    }
+                    std::fprintf(stderr, "[dump] %s: of %llu words differing from recorded-at-call, %llu equal the value recorded before call %s\n", label.c_str(), static_cast<unsigned long long>(differsRecorded), static_cast<unsigned long long>(equalLater), later);
+                }
+                std::uint64_t diffSnapshot = 0, diffRecorded = 0;
+                for (std::size_t i = 0; i + 4 <= now.size(); i += 4) {
+                    diffSnapshot += std::memcmp(now.data() + i, snapshot.data() + i, 4) != 0;
+                    diffRecorded += std::memcmp(now.data() + i, recorded.data() + i, 4) != 0;
+                }
+                std::fprintf(stderr, "[dump] %s 0x%llx+%llu replay %016llx %s | snapshot %016llx %s | recorded-at-call %016llx %s | replay!=snapshot %llu words, replay!=recorded %llu words of %zu\n", label.c_str(), static_cast<unsigned long long>(address),
+                             static_cast<unsigned long long>(bytes), static_cast<unsigned long long>(hash(now)), hex(now).c_str(), static_cast<unsigned long long>(hash(snapshot)), hex(snapshot).c_str(), static_cast<unsigned long long>(hash(recorded)), hex(recorded).c_str(),
+                             static_cast<unsigned long long>(diffSnapshot), static_cast<unsigned long long>(diffRecorded), now.size() / 4);
+                {   // the first words where the replay differs from the capture's recorded value
+                    std::string line;
+                    char c[96];
+                    int shown = 0;
+                    for (std::size_t i = 0; i + 4 <= now.size() && shown < 12; i += 4) {
+                        std::uint32_t w, r, sn;
+                        std::memcpy(&w, now.data() + i, 4); std::memcpy(&r, recorded.data() + i, 4); std::memcpy(&sn, snapshot.data() + i, 4);
+                        if (w == r) continue;
+                        std::snprintf(c, sizeof(c), "\n   +0x%zx replay %08x recorded %08x snapshot %08x", i, w, r, sn);
+                        line += c; ++shown;
+                    }
+                    if (shown != 0) std::fprintf(stderr, "[dump] %s first differing words:%s\n", label.c_str(), line.c_str());
+                }
+                if (bytes <= 1024) {
+                    std::string line;
+                    char c[16];
+                    for (std::size_t i = 0; i + 4 <= now.size(); i += 4) { std::uint32_t w; std::memcpy(&w, now.data() + i, 4); std::snprintf(c, sizeof(c), "%s%08x", i % 32 == 0 ? "\n   +" : " ", w); line += c; }
+                    std::fprintf(stderr, "[dump] %s words (replay):%s\n", label.c_str(), line.c_str());
+                }
+            } catch (const std::exception& error) {
+                std::fprintf(stderr, "[dump] %s 0x%llx+%llu: %s\n", label.c_str(), static_cast<unsigned long long>(address), static_cast<unsigned long long>(bytes), error.what());
+            }
         }
     }
 
