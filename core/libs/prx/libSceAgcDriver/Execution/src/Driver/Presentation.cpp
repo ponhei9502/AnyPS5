@@ -10,6 +10,28 @@
 
 namespace AgcDriver::DriverDetail {
 
+namespace {
+
+void reportClock() {
+    // Counted from the first call, so the first window holds only its own presents.
+    static const auto start = VulkanDevice::PresentCounts();
+    static std::uint64_t previousPresents = start.presents, previousDrops = start.acquireDrops;
+    static auto last = std::chrono::steady_clock::now();
+    const auto now = std::chrono::steady_clock::now();
+    if (now - last < std::chrono::seconds(10)) return;
+    const auto counts = VulkanDevice::PresentCounts();
+    const auto presents = counts.presents - previousPresents;
+    const auto dropped = counts.acquireDrops - previousDrops;
+    const auto windowMs = std::chrono::duration_cast<std::chrono::milliseconds>(now - last).count();
+    const auto epochMs = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch()).count();
+    AgcDriver::ProfilePrint_nid_no_patch("[clock] %lld epoch_ms, %llu presents, %llu dropped over %lld ms\n", static_cast<long long>(epochMs), static_cast<unsigned long long>(presents), static_cast<unsigned long long>(dropped), static_cast<long long>(windowMs));
+    previousPresents = counts.presents;
+    previousDrops = counts.acquireDrops;
+    last = now;
+}
+
+}
+
 std::uint32_t Driver::ReserveEopFlip(const FlipInfo& info) {
     std::lock_guard lock(mutex);
     require(nextEopToken <= EopFlipTokenLimit, "EOP flip token space exhausted");
@@ -87,6 +109,7 @@ void Driver::Present(const PresentationWindow& window, const DisplayBuffer* buff
     static const bool syncFlip = std::getenv("APS5_SYNC_FLIP") != nullptr;
     static const std::size_t inFlight = VulkanDevice::FlipInFlight();
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
+    static const bool presentClock = std::getenv("APS5_PRESENT_CLOCK") != nullptr;
     std::shared_ptr<VulkanDevice> presenting;
     timing.Mark("validate");
     try {
@@ -164,6 +187,7 @@ void Driver::Present(const PresentationWindow& window, const DisplayBuffer* buff
         timing.Mark("release_and_callback");
         TracyZone::MarkFrame();
         if (profile) reportPresents(waitedMs, inFlight);
+        if (presentClock) reportClock();
         CheckFailure();
     } catch (const ProcessShutdown&) {
         throw;
