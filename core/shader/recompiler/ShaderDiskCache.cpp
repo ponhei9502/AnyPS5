@@ -1333,6 +1333,7 @@ constexpr std::string_view NeutralSwitches[] = {
     "APS5_NO_TABLE_SNAPSHOT_REUSE",
     "APS5_RESULT_MEMO_SETS",
     "APS5_RESULT_MEMO_GHOST",
+    "APS5_MEMO_KEY_DIFF",
     "APS5_SPECIALIZED_MODULE_CACHE_MIB",
 };
 

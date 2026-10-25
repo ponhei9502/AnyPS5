@@ -406,6 +406,8 @@ struct SourceEntry : std::enable_shared_from_this<SourceEntry> {
     std::unique_ptr<ResultMemoTable> memo;
     std::uint64_t memoClock = 0;
     std::unordered_set<std::uint64_t> memoGhosts;
+    std::unique_ptr<ResourceSnapshot> keyDiffLast;
+    std::uint64_t keyDiffVariant = 0;
 };
 
 namespace {
@@ -1563,6 +1565,8 @@ struct ResultMemoCounters {
     std::atomic<std::uint64_t> ghostHits{0}, liveEntries{0}, tables{0};
     std::atomic<std::int64_t> lastReport{0};
     std::atomic<std::uint64_t> currentSpirvWords{0};
+    std::atomic<std::uint64_t> keyDiffCompared{0}, keyDiffBufferAddress{0}, keyDiffBufferOther{0}, keyDiffImageAddress{0}, keyDiffImageOther{0}, keyDiffSampler{0}, keyDiffSrt{0}, keyDiffUserData{0}, keyDiffFill{0}, keyDiffTables{0}, keyDiffTableBase{0}, keyDiffOther{0}, keyDiffOnlyAddresses{0};
+    std::array<std::atomic<std::uint64_t>, 64> keyDiffUserDataIndex{};
 };
 
 ResultMemoCounters& resultMemoCounters() {
@@ -1586,6 +1590,33 @@ void reportResultMemo() {
     const auto evictions = counters.evictions.exchange(0, std::memory_order_relaxed);
     const auto populate = counters.populateNanoseconds.exchange(0, std::memory_order_relaxed);
     std::fprintf(stderr, "[recompile] result memo (10 s): %llu hits, %llu misses (%.1f%% hits), Populate %.1f us per miss / %.1f ms in total, %llu evictions\n", static_cast<unsigned long long>(hits), static_cast<unsigned long long>(misses), hits + misses != 0 ? 100.0 * static_cast<double>(hits) / static_cast<double>(hits + misses) : 0.0, misses != 0 ? static_cast<double>(populate) / 1000.0 / static_cast<double>(misses) : 0.0, static_cast<double>(populate) / 1e6, static_cast<unsigned long long>(evictions));
+    static const bool keyDiff = std::getenv("APS5_MEMO_KEY_DIFF") != nullptr;
+    if (keyDiff) {
+        const auto compared = counters.keyDiffCompared.exchange(0, std::memory_order_relaxed);
+        const auto bufferAddress = counters.keyDiffBufferAddress.exchange(0, std::memory_order_relaxed);
+        const auto bufferOther = counters.keyDiffBufferOther.exchange(0, std::memory_order_relaxed);
+        const auto imageAddress = counters.keyDiffImageAddress.exchange(0, std::memory_order_relaxed);
+        const auto imageOther = counters.keyDiffImageOther.exchange(0, std::memory_order_relaxed);
+        const auto sampler = counters.keyDiffSampler.exchange(0, std::memory_order_relaxed);
+        const auto srt = counters.keyDiffSrt.exchange(0, std::memory_order_relaxed);
+        const auto userData = counters.keyDiffUserData.exchange(0, std::memory_order_relaxed);
+        const auto fill = counters.keyDiffFill.exchange(0, std::memory_order_relaxed);
+        const auto tables = counters.keyDiffTables.exchange(0, std::memory_order_relaxed);
+        const auto tableBase = counters.keyDiffTableBase.exchange(0, std::memory_order_relaxed);
+        const auto other = counters.keyDiffOther.exchange(0, std::memory_order_relaxed);
+        const auto onlyAddresses = counters.keyDiffOnlyAddresses.exchange(0, std::memory_order_relaxed);
+        std::array<std::pair<std::uint64_t, int>, 3> top{std::pair<std::uint64_t, int>{0, -1}, std::pair<std::uint64_t, int>{0, -1}, std::pair<std::uint64_t, int>{0, -1}};
+        for (int index = 0; index < 64; ++index) {
+            const auto count = counters.keyDiffUserDataIndex[static_cast<std::size_t>(index)].exchange(0, std::memory_order_relaxed);
+            if (count == 0) continue;
+            // Keep the three largest, in order (insert and shift down).
+            std::pair<std::uint64_t, int> entry{count, index};
+            for (auto& slot : top) {
+                if (entry.first > slot.first) std::swap(entry, slot);
+            }
+        }
+        std::fprintf(stderr, "[recompile] memo key diff (10 s): compared %llu of %llu misses; differ in: buffer address %llu, buffer other %llu, image address %llu, image other %llu, sampler %llu, srt %llu, user data %llu, uniform fill %llu, tables %llu, table base only %llu, other %llu; only addresses/table bases/srt/user data %llu; top user-data indices: %d (%llu), %d (%llu), %d (%llu)\n", static_cast<unsigned long long>(compared), static_cast<unsigned long long>(misses), static_cast<unsigned long long>(bufferAddress), static_cast<unsigned long long>(bufferOther), static_cast<unsigned long long>(imageAddress), static_cast<unsigned long long>(imageOther), static_cast<unsigned long long>(sampler), static_cast<unsigned long long>(srt), static_cast<unsigned long long>(userData), static_cast<unsigned long long>(fill), static_cast<unsigned long long>(tables), static_cast<unsigned long long>(tableBase), static_cast<unsigned long long>(other), static_cast<unsigned long long>(onlyAddresses), top[0].second, static_cast<unsigned long long>(top[0].first), top[1].second, static_cast<unsigned long long>(top[1].first), top[2].second, static_cast<unsigned long long>(top[2].first));
+    }
     static const bool ghost = std::getenv("APS5_RESULT_MEMO_GHOST") != nullptr;
     if (!ghost) return;
     const auto ghostReHits = counters.ghostHits.exchange(0, std::memory_order_relaxed);
@@ -1702,6 +1733,70 @@ std::shared_ptr<const RecompileResult> materializePreparedMemoized(SourceEntry& 
     {
         std::lock_guard lock(source.mutex);
         static const bool ghost = std::getenv("APS5_RESULT_MEMO_GHOST") != nullptr;
+        static const bool keyDiff = std::getenv("APS5_MEMO_KEY_DIFF") != nullptr;
+        if (keyDiff && source.keyDiffLast != nullptr && source.keyDiffVariant == variant->artifact.variantId) {
+            const auto& previous = *source.keyDiffLast;
+            bool bufferAddress = false, bufferOther = false, imageAddress = false, imageOther = false;
+            const auto diffDescriptors = [&](const std::vector<DescriptorValue>& before, const std::vector<DescriptorValue>& after, bool& address, bool& other) {
+                if (before.size() != after.size()) other = true;
+                const auto count = std::min(before.size(), after.size());
+                for (std::size_t i = 0; i < count; ++i) {
+                    const auto& left = before[i];
+                    const auto& right = after[i];
+                    if (left.dwords[0] != right.dwords[0] || left.dwords[1] != right.dwords[1]) address = true;
+                    if (left.dwordCount != right.dwordCount) other = true;
+                    for (std::uint32_t d = 2; d < left.dwordCount && d < left.dwords.size() && d < right.dwords.size(); ++d) {
+                        if (left.dwords[d] != right.dwords[d]) other = true;
+                    }
+                }
+            };
+            diffDescriptors(previous.buffers, snapshot.buffers, bufferAddress, bufferOther);
+            diffDescriptors(previous.images, snapshot.images, imageAddress, imageOther);
+            if (previous.samplers != snapshot.samplers) counters.keyDiffSampler.fetch_add(1, std::memory_order_relaxed);
+            if (previous.flattenedSrt != snapshot.flattenedSrt) counters.keyDiffSrt.fetch_add(1, std::memory_order_relaxed);
+            bool userData = previous.userData.size() != snapshot.userData.size();
+            const auto userCount = std::min(previous.userData.size(), snapshot.userData.size());
+            for (std::size_t i = 0; i < userCount; ++i) {
+                if (previous.userData[i] == snapshot.userData[i]) continue;
+                userData = true;
+                if (i < counters.keyDiffUserDataIndex.size()) counters.keyDiffUserDataIndex[i].fetch_add(1, std::memory_order_relaxed);
+            }
+            if (userData) counters.keyDiffUserData.fetch_add(1, std::memory_order_relaxed);
+            const auto& beforeFill = previous.uniformFill;
+            const auto& afterFill = snapshot.uniformFill;
+            if (beforeFill.kind != afterFill.kind || beforeFill.resource != afterFill.resource || beforeFill.groupStride != afterFill.groupStride || beforeFill.words != afterFill.words || beforeFill.value != afterFill.value) counters.keyDiffFill.fetch_add(1, std::memory_order_relaxed);
+            const auto& beforeTables = previous.tables;
+            const auto& afterTables = snapshot.tables;
+            // A table or a read range (base, size) whose only change is its base address is an address difference (B104-2 could
+            // key it independently of the pointer).
+            bool tableBase = false;
+            bool tables = beforeTables.shader != afterTables.shader || beforeTables.tables.size() != afterTables.tables.size() || beforeTables.ranges.size() != afterTables.ranges.size();
+            for (std::size_t i = 0; i < beforeTables.ranges.size() && !tables; ++i) {
+                tables = beforeTables.ranges[i].second != afterTables.ranges[i].second;
+                tableBase = tableBase || beforeTables.ranges[i].first != afterTables.ranges[i].first;
+            }
+            const auto tableCount = std::min(beforeTables.tables.size(), afterTables.tables.size());
+            for (std::size_t i = 0; i < tableCount && !tables; ++i) {
+                const auto& left = beforeTables.tables[i];
+                const auto& right = afterTables.tables[i];
+                tableBase = tableBase || left.base != right.base;
+                tables = left.size != right.size || left.records != right.records || left.keys != right.keys || left.fault != right.fault || left.outside != right.outside || left.codes.Hash() != right.codes.Hash() || left.words.Hash() != right.words.Hash() || left.readRanges.Hash() != right.readRanges.Hash();
+            }
+            if (tables) counters.keyDiffTables.fetch_add(1, std::memory_order_relaxed);
+            else if (tableBase) counters.keyDiffTableBase.fetch_add(1, std::memory_order_relaxed);
+            if (bufferAddress) counters.keyDiffBufferAddress.fetch_add(1, std::memory_order_relaxed);
+            if (bufferOther) counters.keyDiffBufferOther.fetch_add(1, std::memory_order_relaxed);
+            if (imageAddress) counters.keyDiffImageAddress.fetch_add(1, std::memory_order_relaxed);
+            if (imageOther) counters.keyDiffImageOther.fetch_add(1, std::memory_order_relaxed);
+            const bool anyClass = bufferAddress || bufferOther || imageAddress || imageOther || previous.samplers != snapshot.samplers || previous.flattenedSrt != snapshot.flattenedSrt || userData || beforeFill.kind != afterFill.kind || beforeFill.resource != afterFill.resource || beforeFill.groupStride != afterFill.groupStride || beforeFill.words != afterFill.words || beforeFill.value != afterFill.value || tables || tableBase;
+            if (!anyClass) counters.keyDiffOther.fetch_add(1, std::memory_order_relaxed);
+            if ((bufferAddress || imageAddress || tableBase || previous.flattenedSrt != snapshot.flattenedSrt || userData) && !bufferOther && !imageOther && previous.samplers == snapshot.samplers && beforeFill.kind == afterFill.kind && beforeFill.resource == afterFill.resource && beforeFill.groupStride == afterFill.groupStride && beforeFill.words == afterFill.words && beforeFill.value == afterFill.value && !tables) counters.keyDiffOnlyAddresses.fetch_add(1, std::memory_order_relaxed);
+            counters.keyDiffCompared.fetch_add(1, std::memory_order_relaxed);
+        }
+        if (keyDiff) {
+            source.keyDiffLast = std::make_unique<ResourceSnapshot>(snapshot);
+            source.keyDiffVariant = variant->artifact.variantId;
+        }
         if (ghost && source.memoGhosts.erase(index) != 0) counters.ghostHits.fetch_add(1, std::memory_order_relaxed);
         if (source.memo == nullptr) {
             source.memo = std::make_unique<ResultMemoTable>(ResultMemoSets() * ResultMemoWays);
