@@ -6,6 +6,12 @@
 #include <algorithm>
 #include <spirv/unified1/spirv.hpp>
 
+#include <atomic>
+
+#include <cstdio>
+
+#include <cstdlib>
+
 namespace AgcDriver::DriverDetail {
 
 namespace {
@@ -110,6 +116,11 @@ void DecodeGraphicsPrograms(DrawDecode& decoded, const QueueState& queue, const 
         if (nullPixel) address = NullPixelProgramAddress();
         const auto program = ProgramSnapshot(registry, address, {type});
         const auto& snapshot = *program;
+        {   // B71d probe: APS5_PROBE_DISPATCH=1 also logs the program of every draw stage
+            static const bool probeDraw = std::getenv("APS5_PROBE_DISPATCH") != nullptr;
+            static std::atomic<std::uint64_t> probeDrawSerial{0};
+            if (probeDraw) std::fprintf(stderr, "[probe] draw program %llu stage %d address 0x%llx code 0x%llx\n", static_cast<unsigned long long>(++probeDrawSerial), static_cast<int>(stage), static_cast<unsigned long long>(address), static_cast<unsigned long long>(snapshot.codeAddress));
+        }
         require((address - snapshot.codeAddress) % sizeof(std::uint32_t) == 0, "graphics entry point is not dword aligned");
         require(snapshot.header.empty() || snapshot.type == type, "graphics program refers to an incompatible shader binary type");
         if (!nullPixel && snapshot.header.empty()) NoteRawGraphicsDraw(snapshot);

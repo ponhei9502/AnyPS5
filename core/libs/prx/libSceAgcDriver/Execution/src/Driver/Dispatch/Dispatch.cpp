@@ -1,6 +1,9 @@
 #include "prx/libSceAgcDriver/Execution/include/ProfileOutput.hpp"
 #include "prx/libSceAgcDriver/Execution/include/PerformanceTimer.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
+#include <cstdio>
+#include <cstring>
+#include <atomic>
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawPipeline.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Memory/DrawWriteRanges.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Diagnostics.hpp"
@@ -67,6 +70,16 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
     PerformanceTimer timing("Driver.Dispatch");
     const auto address = (static_cast<std::uint64_t>(readRegister(queue.shader, 0x20c)) << 8u) | (static_cast<std::uint64_t>(readRegister(queue.shader, 0x20d) & 0xffu) << 40u);
     if (SkippedShader(address)) return;
+    {   // B71d probe: APS5_PROBE_DISPATCH=1 logs every dispatch (program, groups or indirect arguments with the values as the CPU sees them)
+        static const bool probeDispatch = std::getenv("APS5_PROBE_DISPATCH") != nullptr;
+        if (probeDispatch) {
+            static std::atomic<std::uint64_t> probeSerial{0};
+            std::uint32_t seen[3] = {0, 0, 0};
+            if (indirectArguments != 0 && GuestMemory::Accessible(reinterpret_cast<const void*>(indirectArguments), sizeof(seen))) std::memcpy(seen, reinterpret_cast<const void*>(indirectArguments), sizeof(seen));
+            std::fprintf(stderr, "[probe] dispatch %llu queue 0x%x program 0x%llx groups %u %u %u initiator 0x%x indirect 0x%llx cpu-view %u %u %u\n", static_cast<unsigned long long>(++probeSerial), submission.queue, static_cast<unsigned long long>(address),
+                         packet.size() > 3 ? packet[1] : 0u, packet.size() > 3 ? packet[2] : 0u, packet.size() > 3 ? packet[3] : 0u, packet.empty() ? 0u : packet.back(), static_cast<unsigned long long>(indirectArguments), seen[0], seen[1], seen[2]);
+        }
+    }
     auto registeredShader = RegisteredProgram(*submission.shaders, address, {0});
     if (!registeredShader) registeredShader = ReadRawShader(address);
     const auto& snapshot = *registeredShader;
