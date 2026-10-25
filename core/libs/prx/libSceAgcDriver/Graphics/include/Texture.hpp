@@ -118,6 +118,8 @@ public:
     void MarkRefreshedPerUse() { perUseCopy = PerUseCopy::RemadePerUse; }
     bool Released() const { return released.load(std::memory_order_acquire); }
     void MarkReleased() { released.store(true, std::memory_order_release); }
+    // B66c part 2: the present count when a cached record last reused this texture (APS5_TEXTURE_HELD_EVICT).
+    std::atomic<std::uint64_t> lastBound{0};
 
 private:
     void release() noexcept;

@@ -146,6 +146,7 @@ struct TextureCache {
         std::uint64_t evicted = 0;
         std::uint64_t passed = 0;
         std::uint64_t stale = 0;
+        std::uint64_t heldEvicted = 0;
     } counts;
     std::chrono::steady_clock::time_point countsReported = std::chrono::steady_clock::now();
     VkPhysicalDevice budgetDevice = VK_NULL_HANDLE;
@@ -225,6 +226,7 @@ std::list<CachedTexture>::iterator findTexture(TextureCache& cache, const Textur
 }
 
 std::uint64_t SnapshotPoolBytes();
+std::uint64_t HeldEvictFrames();
 void parkSnapshot(TextureCache& cache, std::vector<std::byte>& bytes);
 
 void eraseTexture(TextureCache& cache, std::list<CachedTexture>::iterator it) {
@@ -264,6 +266,7 @@ void dropUncachedViews(TextureCache& cache) {
 void touchTexture(TextureCache& cache, std::list<CachedTexture>::iterator it) {
     cache.entries.splice(cache.entries.begin(), cache.entries, it);
     it->present = Recorder::Presents();
+    if (HeldEvictFrames() != 0 && it->texture != nullptr) it->texture->lastBound.store(it->present, std::memory_order_relaxed);
 }
 
 constexpr std::uint64_t SpareSnapshotBytes = 256ull << 20;
@@ -280,6 +283,19 @@ std::uint64_t SnapshotPoolBytes() {
         return value != nullptr ? static_cast<std::uint64_t>(std::strtoull(value, nullptr, 10)) << 20u : std::uint64_t{0};
     }();
     return bytes;
+}
+
+// B66c part 2 (10-25, APS5_TEXTURE_HELD_EVICT=<frames>, default 0 = no change): a held cache entry
+// whose texture no cached record reused for this many frames is evicted like an unheld one.
+std::uint64_t HeldEvictFrames() {
+    static const std::uint64_t frames = [] {
+        const char* value = std::getenv("APS5_TEXTURE_HELD_EVICT");
+        if (value == nullptr) return std::uint64_t{0};
+        char* end = nullptr;
+        const auto parsed = std::strtoull(value, &end, 10);
+        return end != value && *end == '\0' ? static_cast<std::uint64_t>(parsed) : std::uint64_t{0};
+    }();
+    return frames;
 }
 
 struct SnapshotPoolCounts {
@@ -415,7 +431,8 @@ bool admitTexture(TextureCache& cache, const TextureKey& key, std::uint64_t inco
             ++cache.counts.uncached;
             return false;
         }
-        const bool keep = back->accounted == 0 || (!over && back->texture.use_count() > 1);
+        const bool idle = HeldEvictFrames() != 0 && present - std::max(back->present, back->texture->lastBound.load(std::memory_order_relaxed)) >= HeldEvictFrames();
+        const bool keep = back->accounted == 0 || (!over && back->texture.use_count() > 1 && !idle);
         if (keep && cache.passed < cache.entries.size()) {
             cache.entries.splice(cache.entries.begin(), cache.entries, back);
             ++cache.passed;
@@ -423,6 +440,7 @@ bool admitTexture(TextureCache& cache, const TextureKey& key, std::uint64_t inco
         } else if (keep && !over) {
             break;
         } else {
+            if (HeldEvictFrames() != 0 && back->texture.use_count() > 1) ++cache.counts.heldEvicted;
             eraseTexture(cache, back);
             ++cache.counts.evicted;
         }
@@ -448,7 +466,7 @@ void reportCacheCounts(TextureCache& cache, std::uint64_t budget) {
         ++heldEntries;
         heldBytes += entry.accounted;
     }
-    AgcDriver::ProfilePrint_nid_no_patch("[texture-cache] (10 s): %llu textures cached, %llu used uncached (first use this frame with the least recently used entry used this frame or the last, or a later use with it used this frame), %llu evicted, %llu held ones passed over, %llu found changed; %llu MiB in %zu entries, budget %llu MiB, frame %llu; held %llu entries, held MiB %llu; live resource sets %lld\n", static_cast<unsigned long long>(counts.inserted), static_cast<unsigned long long>(counts.uncached), static_cast<unsigned long long>(counts.evicted), static_cast<unsigned long long>(counts.passed), static_cast<unsigned long long>(counts.stale), static_cast<unsigned long long>(cache.bytes >> 20u), cache.entries.size(), static_cast<unsigned long long>(budget >> 20u), static_cast<unsigned long long>(Recorder::Presents()), static_cast<unsigned long long>(heldEntries), static_cast<unsigned long long>(heldBytes >> 20u), static_cast<long long>(liveResourceSets.load(std::memory_order_relaxed)));
+    AgcDriver::ProfilePrint_nid_no_patch("[texture-cache] (10 s): %llu textures cached, %llu used uncached (first use this frame with the least recently used entry used this frame or the last, or a later use with it used this frame), %llu evicted, %llu held ones passed over, %llu found changed; %llu MiB in %zu entries, budget %llu MiB, frame %llu; held %llu entries, held MiB %llu; live resource sets %lld, held evicted %llu\n", static_cast<unsigned long long>(counts.inserted), static_cast<unsigned long long>(counts.uncached), static_cast<unsigned long long>(counts.evicted), static_cast<unsigned long long>(counts.passed), static_cast<unsigned long long>(counts.stale), static_cast<unsigned long long>(cache.bytes >> 20u), cache.entries.size(), static_cast<unsigned long long>(budget >> 20u), static_cast<unsigned long long>(Recorder::Presents()), static_cast<unsigned long long>(heldEntries), static_cast<unsigned long long>(heldBytes >> 20u), static_cast<long long>(liveResourceSets.load(std::memory_order_relaxed)), static_cast<unsigned long long>(counts.heldEvicted));
 }
 
 struct ImageMemoEntry {
@@ -3381,6 +3399,12 @@ bool ShaderResources::fastRevalidate(std::uint64_t serialBefore, std::span<const
         if (surface.source == nullptr) surface.generation = surface.collected;
         surface.keys = scannedKeys[i];
     }
+    if (HeldEvictFrames() != 0) {
+        const auto present = Recorder::Presents();
+        for (const auto& texture : textures) {
+            if (texture != nullptr) texture->lastBound.store(present, std::memory_order_relaxed);
+        }
+    }
     return true;
 }
 
@@ -3445,6 +3469,12 @@ bool ShaderResources::fastRevalidateEach() {
     // stamps are the same set either way.
     for (auto& surface : validatedTextures) {
         if (surface.source == nullptr) surface.generation = surface.collected;
+    }
+    if (HeldEvictFrames() != 0) {
+        const auto present = Recorder::Presents();
+        for (const auto& texture : textures) {
+            if (texture != nullptr) texture->lastBound.store(present, std::memory_order_relaxed);
+        }
     }
     return true;
 }
