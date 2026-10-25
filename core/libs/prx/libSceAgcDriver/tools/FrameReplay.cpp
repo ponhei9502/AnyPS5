@@ -69,7 +69,7 @@ struct Options {
     std::chrono::milliseconds memoryPaceTimeout{10000};
     std::chrono::milliseconds releaseAfter{3};
     std::chrono::milliseconds drainTimeout{10000};
-    bool release = true;
+    bool release = false;   // B71d: off by default; a helper that fakes GPU completion hides ordering bugs (it broke the picture: pixels 0.000 vs 0.95)
     bool synthesize = true;
     bool checkSubmits = false;
     bool dryCheck = false;
@@ -970,8 +970,8 @@ int usage() {
                          "  replays the driver calls and guest memory that APS5_FRAME_CAPTURE=<directory> recorded, through this\n"
                          "  build's AGC driver with no title running, and prints one JSON line with the frame times\n"
                          "  --no-pace           issues calls without waiting for the in-flight depth the title had\n"
-                         "  --no-release        never copies recorded CPU stores early to release a GPU wait\n"
-                         "  --release-after-ms  milliseconds without a completion before awaited dwords are released (3)\n"
+                         "  --no-release        the default: never copies recorded CPU stores early to release a GPU wait\n"
+                         "  --release-after-ms  turns the early release ON: milliseconds without a completion before awaited dwords are released (it breaks cross-queue ordering; off by default)\n"
                          "  --pace-timeout-ms   milliseconds a paced call waits for its in-flight depth before giving up (10000)\n"
                          "  --drain-timeout-ms  milliseconds without a completion before the drain gives up (10000)\n"
                          "  --no-synthesize     releases a wait only with a value the capture recorded, never with its reference value\n"
@@ -1158,9 +1158,9 @@ int main(int argc, char** argv) {
     for (int index = 1; index < argc; ++index) {
         const std::string_view argument = argv[index];
         if (argument == "--no-pace") options.pace = false;
-        else if (argument == "--no-release") options.release = false;
+        else if (argument == "--no-release") options.release = false;   // the default now
         else if (argument == "--no-synthesize") options.synthesize = false;
-        else if (argument == "--release-after-ms" && index + 1 < argc) options.releaseAfter = std::chrono::milliseconds(std::strtoll(argv[++index], nullptr, 10));
+        else if (argument == "--release-after-ms" && index + 1 < argc) { options.releaseAfter = std::chrono::milliseconds(std::strtoll(argv[++index], nullptr, 10)); options.release = true; }
         else if (argument == "--pace-timeout-ms" && index + 1 < argc) options.paceTimeout = std::chrono::milliseconds(std::strtoll(argv[++index], nullptr, 10));
         else if (argument == "--drain-timeout-ms" && index + 1 < argc) options.drainTimeout = std::chrono::milliseconds(std::strtoll(argv[++index], nullptr, 10));
         else if (argument == "--strict") options.strict = true;
