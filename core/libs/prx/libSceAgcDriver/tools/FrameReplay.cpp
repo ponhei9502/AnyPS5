@@ -161,6 +161,33 @@ void checkSubmitWords(const FrameCall& call, std::atomic<std::uint64_t>& zeroSub
     }
 }
 
+// B71d-g diagnostic (APS5_DRY_TRACE=1 with --dry-check): one stderr line per PM4 packet that waits on or writes memory.
+void traceSubmit(const FrameCall& call) {
+    const auto* words = reinterpret_cast<const std::uint32_t*>(static_cast<std::uintptr_t>(call.address));
+    const auto count = static_cast<std::uint32_t>(call.size);
+    const auto address = [](std::uint32_t low, std::uint32_t high) { return (static_cast<std::uint64_t>(high) << 32) | (low & ~3u); };
+    for (std::uint32_t i = 0; i < count;) {
+        const auto header = words[i];
+        if (header == 0 || (header >> 30) != 3) { ++i; continue; }
+        const auto opcode = (header >> 8) & 0xff;
+        const auto length = 2 + ((header >> 16) & 0x3fff);
+        const char* what = nullptr;
+        std::uint64_t target = 0;
+        std::uint64_t value = 0;
+        std::uint64_t mask = 0;
+        if (opcode == 0x3c && i + 6 < count) { what = "WAIT_REG_MEM"; target = address(words[i + 2], words[i + 3]); value = words[i + 4]; mask = words[i + 5]; }
+        else if (opcode == 0x37 && i + 3 < count) { what = "WRITE_DATA"; target = address(words[i + 2], words[i + 3]); value = i + 4 < count ? words[i + 4] : 0; }
+        else if (opcode == 0x49 && i + 5 < count) { what = "RELEASE_MEM"; target = address(words[i + 3], words[i + 4]); value = words[i + 5]; mask = words[i + 2] >> 29; }
+        else if (opcode == 0x47 && i + 4 < count) { what = "EVENT_WRITE_EOP"; target = address(words[i + 2], words[i + 3]); value = words[i + 4]; }
+        if (what != nullptr) {
+            std::fprintf(stderr, "[trace] call %llu queue %u serials %llu/%llu dword %u %s addr 0x%llx value/ref 0x%llx mask/sel 0x%llx fn %u now 0x%x\n", static_cast<unsigned long long>(call.ordinal), call.queue,
+                         static_cast<unsigned long long>(call.completed), static_cast<unsigned long long>(call.accepted), i, what, static_cast<unsigned long long>(target), static_cast<unsigned long long>(value),
+                         static_cast<unsigned long long>(mask), opcode == 0x3c ? (words[i + 1] & 7u) : 0u, opcode == 0x3c ? *reinterpret_cast<const volatile std::uint32_t*>(static_cast<std::uintptr_t>(target)) : 0u);
+        }
+        i += length;
+    }
+}
+
 bool committedWritable(std::uint64_t address, std::uint64_t bytes) {
 #ifdef _WIN32
     for (auto at = address; at < address + bytes;) {
@@ -361,6 +388,7 @@ struct Replay {
     std::atomic<std::uint64_t> zeroSubmits{0};
     std::atomic<std::uint64_t> badHeaderSubmits{0};
     std::atomic<std::size_t> sequenced{0};
+    std::atomic<bool> stallDescribed{false}; // B71d-g
     std::uint64_t unfinished = 0;
     std::size_t threads = 0;
     bool recording = false;
@@ -403,6 +431,7 @@ struct Replay {
                 stalledAt.store(completed);
                 std::fprintf(stderr, "[frame-replay] pacing gave up at call %llu (%s): serials %llu/%llu, the capture had %llu in flight\n", static_cast<unsigned long long>(call.ordinal),
                              std::string(AgcDriver::FrameCallName(call.kind)).c_str(), static_cast<unsigned long long>(completed), static_cast<unsigned long long>(accepted), static_cast<unsigned long long>(inFlight));
+                if (!stallDescribed.exchange(true)) describeStall("pacing"); // B71d-g
                 ++paceTimeouts;
                 if (options.strict) throw std::runtime_error("frame replay: call " + std::to_string(call.ordinal) + " waited longer than the pacing timeout");
                 return;
@@ -538,6 +567,23 @@ struct Replay {
         return false;
     }
 
+    // B71d-g: name what the driver is waiting on when a replay stalls; one stderr line per awaited wait.
+    void describeStall(const char* where) {
+        std::array<AgcDriver::AwaitedWait, 64> awaited{};
+        const auto count = AgcDriverAwaitedWaits_nid_postfix(awaited.data(), awaited.size());
+        const auto [accepted, completed] = progress();
+        std::fprintf(stderr, "[frame-replay] stall: %llu awaited waits (%s), serials %llu/%llu\n", static_cast<unsigned long long>(count), where, static_cast<unsigned long long>(completed),
+                     static_cast<unsigned long long>(accepted));
+        for (std::size_t slot = 0; slot < count; ++slot) {
+            const auto& wait = awaited[slot];
+            if (wait.address == 0) continue;
+            const std::size_t bytes = wait.bytes == 8 ? 8 : 4;
+            std::fprintf(stderr, "[frame-replay] stall: wait at 0x%llx bytes %u function %u mask 0x%llx reference 0x%llx now 0x%llx (%s)\n", static_cast<unsigned long long>(wait.address),
+                         static_cast<unsigned>(wait.bytes), static_cast<unsigned>(wait.function), static_cast<unsigned long long>(wait.mask), static_cast<unsigned long long>(wait.reference),
+                         static_cast<unsigned long long>(load(wait.address, bytes)), where);
+        }
+    }
+
     void releaseAwaited(std::span<const FrameCall> calls, std::size_t from) {
         std::lock_guard lock(memoryMutex);
         std::array<AgcDriver::AwaitedWait, 64> awaited{};
@@ -638,6 +684,7 @@ struct Replay {
             } else if (Clock::now() - lastProgress >= options.drainTimeout) {
                 std::fprintf(stderr, "[frame-replay] %llu submissions did not complete after the last captured call (serials %llu/%llu)\n", static_cast<unsigned long long>(unfinished),
                              static_cast<unsigned long long>(completed), static_cast<unsigned long long>(accepted));
+                describeStall("drain"); // B71d-g
                 return;
             }
             std::this_thread::sleep_for(std::chrono::milliseconds(5));
@@ -778,8 +825,10 @@ int run(const Options& options) {
                 for (const auto* chunk : found->second) {
                     if (skipped.Overlaps(*chunk)) continue;
                     restore(reader, *chunk);
+                    if (std::getenv("APS5_DRY_TRACE") != nullptr && chunk->bytes <= 256) std::fprintf(stderr, "[trace] memory call %llu group %llu delta 0x%llx+%llu\n", static_cast<unsigned long long>(call->ordinal), static_cast<unsigned long long>(chunk->group), static_cast<unsigned long long>(chunk->address), static_cast<unsigned long long>(chunk->bytes));
                 }
             } else if (call->kind == FrameCallKind::Submit) {
+                if (std::getenv("APS5_DRY_TRACE") != nullptr) traceSubmit(*call);
                 std::atomic<std::uint64_t> zeroSubmits{zero};
                 std::atomic<std::uint64_t> badHeaderSubmits{bad};
                 checkSubmitWords(*call, zeroSubmits, badHeaderSubmits);
