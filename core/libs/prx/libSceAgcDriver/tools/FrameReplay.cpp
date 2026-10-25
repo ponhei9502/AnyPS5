@@ -70,6 +70,7 @@ struct Options {
     bool release = true;
     bool synthesize = true;
     bool checkSubmits = false;
+    bool dryCheck = false;
 };
 
 class Frames {
@@ -135,6 +136,28 @@ std::uint64_t headerNumber(const std::string& header, std::string_view key) {
 
 void restore(const FrameCaptureReader& reader, const FrameMemoryChunk& chunk) {
     reader.Read(chunk, std::span(reinterpret_cast<std::byte*>(static_cast<std::uintptr_t>(chunk.address)), static_cast<std::size_t>(chunk.bytes)));
+}
+
+void checkSubmitWords(const FrameCall& call, std::atomic<std::uint64_t>& zeroSubmits, std::atomic<std::uint64_t>& badHeaderSubmits) {
+    const std::uint32_t* words = reinterpret_cast<const std::uint32_t*>(call.address);
+    const std::uint32_t count = static_cast<std::uint32_t>(call.size);
+    bool zeros = count == 0;
+    for (std::uint32_t i = 0; i < count && zeros; ++i) zeros = words[i] == 0;
+    if (zeros) {
+        ++zeroSubmits;
+        std::fprintf(stderr, "[frame-replay] check: submit at %llx (%u dwords, call %llu) is all zeros\n", static_cast<unsigned long long>(call.address), count, static_cast<unsigned long long>(call.ordinal));
+    } else {
+        std::uint32_t i = 0;
+        while (i < count) {
+            const std::uint32_t header = words[i];
+            if (header == 0) {
+                ++badHeaderSubmits;
+                std::fprintf(stderr, "[frame-replay] check: submit at %llx has PM4 header 0 at DWORD %u of %u\n", static_cast<unsigned long long>(call.address), i, count);
+                break;
+            }
+            i += (header >> 30) == 3 ? 2 + ((header >> 16) & 0x3fff) : 1;
+        }
+    }
 }
 
 bool committedWritable(std::uint64_t address, std::uint64_t bytes) {
@@ -422,27 +445,7 @@ struct Replay {
             sceAgcDriverSetTFRing(reinterpret_cast<const volatile void*>(static_cast<std::uintptr_t>(call.address)), static_cast<std::uint32_t>(call.size));
             return;
         case FrameCallKind::Submit: {
-            const std::uint32_t* words = reinterpret_cast<const std::uint32_t*>(call.address);
-            const std::uint32_t count = static_cast<std::uint32_t>(call.size);
-            if (options.checkSubmits) {
-                bool zeros = count == 0;
-                for (std::uint32_t i = 0; i < count && zeros; ++i) zeros = words[i] == 0;
-                if (zeros) {
-                    ++zeroSubmits;
-                    std::fprintf(stderr, "[frame-replay] check: submit at %llx (%u dwords, call %llu) is all zeros\n", static_cast<unsigned long long>(call.address), count, static_cast<unsigned long long>(call.ordinal));
-                } else {
-                    std::uint32_t i = 0;
-                    while (i < count) {
-                        const std::uint32_t header = words[i];
-                        if (header == 0) {
-                            ++badHeaderSubmits;
-                            std::fprintf(stderr, "[frame-replay] check: submit at %llx has PM4 header 0 at DWORD %u of %u\n", static_cast<unsigned long long>(call.address), i, count);
-                            break;
-                        }
-                        i += (header >> 30) == 3 ? 2 + ((header >> 16) & 0x3fff) : 1;
-                    }
-                }
-            }
+            if (options.checkSubmits) checkSubmitWords(call, zeroSubmits, badHeaderSubmits);
             const Packet packet{reinterpret_cast<std::uint32_t*>(static_cast<std::uintptr_t>(call.address)), static_cast<std::uint32_t>(call.size), static_cast<std::uint8_t>(call.flags), {}};
             if (call.queue == 0) sceAgcDriverSubmitDcb(&packet);
             else sceAgcDriverSubmitAcb(call.queue, &packet);
@@ -671,6 +674,7 @@ int usage() {
                          "  --no-synthesize     releases a wait only with a value the capture recorded, never with its reference value\n"
                          "  --strict            fails on a pacing timeout or a failed registration inside the captured frames\n"
                          "  --check-submits     reports zero-filled or malformed PM4 submissions in the JSON line\n"
+                         "  --dry-check         checks the capture without a device and prints one JSON line\n"
                          "  --dump              writes guest memory to a file after the replay (hexadecimal or decimal)\n"
                          "  --frames <dir>      writes each recorded and replayed display buffer as reference-<n>.bmp and replay-<n>.bmp\n");
     return 2;
@@ -756,6 +760,39 @@ int run(const Options& options) {
     const FrameCaptureReader reader(options.directory);
     if (reader.Truncated()) std::fprintf(stderr, "[frame-replay] the capture is truncated; replaying the complete records\n");
     auto skipped = restoreMemory(reader);
+    if (options.dryCheck) {
+        std::map<std::uint64_t, std::vector<const FrameMemoryChunk*>> groups;
+        for (const auto& chunk : reader.Chunks()) {
+            if (chunk.kind == FrameMemoryKind::Delta) groups[chunk.group].push_back(&chunk);
+        }
+        std::uint64_t zero = 0;
+        std::uint64_t bad = 0;
+        std::uint64_t submits = 0;
+        const auto& calls = reader.Calls();
+        const auto frameStart = std::find_if(calls.begin(), calls.end(), [](const FrameCall& call) { return call.kind == FrameCallKind::FrameStart; });
+        for (auto call = frameStart == calls.end() ? calls.end() : frameStart + 1; call != calls.end(); ++call) {
+            if (call->kind == FrameCallKind::Memory) {
+                const auto found = groups.find(call->values.at(0));
+                if (found == groups.end()) continue;
+                for (const auto* chunk : found->second) {
+                    if (skipped.Overlaps(*chunk)) continue;
+                    restore(reader, *chunk);
+                }
+            } else if (call->kind == FrameCallKind::Submit) {
+                std::atomic<std::uint64_t> zeroSubmits{zero};
+                std::atomic<std::uint64_t> badHeaderSubmits{bad};
+                checkSubmitWords(*call, zeroSubmits, badHeaderSubmits);
+                zero = zeroSubmits.load();
+                bad = badHeaderSubmits.load();
+                ++submits;
+            }
+        }
+        std::printf("{\"dry_check\":true,\"submits\":%llu,\"zero_submits\":%llu,\"bad_header_submits\":%llu,\"memory_groups\":%zu,\"skipped_mib\":%.1f}\n",
+                    static_cast<unsigned long long>(submits), static_cast<unsigned long long>(zero), static_cast<unsigned long long>(bad), groups.size(),
+                    static_cast<double>(skipped.bytes) / (1024.0 * 1024.0));
+        std::fflush(stdout);
+        return (zero == 0 && bad == 0) ? 0 : 3;
+    }
     const auto loaded = Clock::now();
     Replay replay{options, reader};
     replay.skipped = std::move(skipped);
@@ -810,6 +847,7 @@ int main(int argc, char** argv) {
         else if (argument == "--release-after-ms" && index + 1 < argc) options.releaseAfter = std::chrono::milliseconds(std::strtoll(argv[++index], nullptr, 10));
         else if (argument == "--strict") options.strict = true;
         else if (argument == "--check-submits") options.checkSubmits = true;
+        else if (argument == "--dry-check") { options.dryCheck = true; options.checkSubmits = true; }
         else if (argument == "--dump" && index + 1 < argc) options.dumps.push_back(parseDump(argv[++index]));
         else if (argument == "--frames" && index + 1 < argc) options.frames = argv[++index];
         else if (!argument.starts_with("-") && options.directory.empty()) options.directory = argument;
